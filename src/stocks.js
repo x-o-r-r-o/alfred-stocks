@@ -20,6 +20,7 @@ const OPEN_TTL = 60; // quote TTL while a market session (pre/regular/post) is o
 const CLOSED_TTL = 15 * 60; // …and while it is closed
 const MISSING_TTL = 60 * 60; // remember unknown symbols for an hour
 const SEARCH_TTL = 24 * 60 * 60;
+const EMPTY_SEARCH_TTL = 10 * 60; // an empty answer may be a glitch: ask again sooner
 const LOCK_TTL = 30; // a refresh lock older than this is considered dead
 const MAX_WATCHLIST = 50;
 const SYMBOL_RE = /^[A-Z0-9^][A-Z0-9.^=\-:\/_&]{0,31}$/;
@@ -147,7 +148,9 @@ function httpMany(reqs) {
   }
   const out = reqs.map((r, i) => {
     const m = meta[i] || { status: 0, exit: -1, error: res.stderr.trim() || "curl failed" };
-    return Object.assign(m, { body: readFile(`${dir}/${i}`) || "" });
+    const path = `${dir}/${i}`;
+    const body = readFile(path);
+    return Object.assign(m, { body: body !== null ? body : exists(path) ? "\ufffd(not UTF-8)" : "" });
   });
   FM.removeItemAtPathError(dir, $());
   return out;
@@ -171,7 +174,7 @@ function parseBody(p, r, { notFoundOk = false } = {}) {
   }
   if (r.status === 401 || r.status === 403) throw new ProviderError("auth", p.needsKey ? "API key rejected" : "access denied", r.status);
   if (r.status === 429) throw new ProviderError("rate", "rate limited", r.status);
-  if (r.status === 404 && notFoundOk) return null;
+  if ((r.status === 404 || r.status === 400) && notFoundOk) return null; // Yahoo: 404 for unknown/delisted symbols
   if (r.status >= 500) throw new ProviderError("server", "server error", r.status);
   const body = (r.body || "").trim();
   if (!body) throw new ProviderError("parse", "empty response", r.status);
@@ -223,7 +226,11 @@ function stateOf(q, t) {
     const inside = (p) => p && t >= p.start && t < p.end;
     return inside(q.periods.regular) ? "REGULAR" : inside(q.periods.pre) ? "PRE" : inside(q.periods.post) ? "POST" : "CLOSED";
   }
-  if (q.usHours) return q.open ? "REGULAR" : usState(t) === "REGULAR" && q.open === false ? "CLOSED" : usState(t);
+  if (q.usHours) {
+    // the provider's open/closed flag only holds for the session it was fetched in (it catches holidays)
+    const live = usState(t);
+    return live === "REGULAR" && q.open === false && usState(q.fetched) === "REGULAR" && t - q.fetched < 8 * 3600 ? "CLOSED" : live;
+  }
   return q.state || null;
 }
 
@@ -500,15 +507,16 @@ function fmtPct(v) {
   return signed(nf(2, 2).format(v), v) + "%";
 }
 
-function fmtTime(t) {
-  return new Intl.DateTimeFormat(LOCALE, { hour: "numeric", minute: "2-digit" }).format(new Date(t * 1000));
+function fmtTime(t, ref) {
+  const opts = ref - t > 20 * 3600 ? { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" } : { hour: "numeric", minute: "2-digit" };
+  return new Intl.DateTimeFormat(LOCALE, opts).format(new Date(t * 1000));
 }
 
 // change and % change, computed when the provider doesn't send them
 function changes(q) {
   let change = num(q.change), pct = num(q.pct);
   if (change === null && q.prev !== null && q.prev !== undefined) change = q.price - q.prev;
-  if (pct === null && change !== null && q.prev) pct = (change / q.prev) * 100;
+  if (pct === null && change !== null && q.prev) pct = (change / Math.abs(q.prev)) * 100; // prev < 0: oil futures, April 2020
   return { change, pct };
 }
 
@@ -590,7 +598,8 @@ function ttl(e, t) {
   return s === "CLOSED" ? CLOSED_TTL : OPEN_TTL;
 }
 function fresh(e, t) {
-  return e && t - e.fetched < ttl(e, t);
+  // a timestamp from the future (the clock was changed) doesn't keep a quote fresh forever
+  return !!e && e.fetched <= t + 60 && t - e.fetched < ttl(e, t);
 }
 
 function setStatus(err) {
@@ -692,6 +701,7 @@ function fetchQuotes(symbols, names = {}) {
   });
   saveQuotes(entries);
   pruneSparklines(entries);
+  setStatus(error); // a successful fetch (search or refresh) clears the watchlist's error row
   return { entries, error };
 }
 
@@ -712,10 +722,10 @@ function search(q) {
   const k = `${p.id}:${q.toLowerCase()}`;
   const cache = readJSON(searchPath(), {});
   const hit = cache[k];
-  if (hit && now() - hit.at < SEARCH_TTL && Array.isArray(hit.results)) return hit.results;
+  if (hit && Array.isArray(hit.results) && now() - hit.at < (hit.results.length ? SEARCH_TTL : EMPTY_SEARCH_TTL) && hit.at <= now() + 60) return hit.results;
   const key = p.needsKey ? KEY || (KEY = getKey(p)) : "";
   let results = p.parseSearch(parseBody(p, httpMany([p.searchReq(q, key)])[0]));
-  const plain = q.normalize("NFD").replace(/[̀-ͯ]/g, "");
+  const plain = q.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   if (!results.length && plain !== q) results = p.parseSearch(parseBody(p, httpMany([p.searchReq(plain, key)])[0]));
   const seen = new Set();
   results = results.filter((r) => SYMBOL_RE.test(r.symbol) && !seen.has(r.symbol) && seen.add(r.symbol)).slice(0, 10);
@@ -779,8 +789,10 @@ function info(title, subtitle, iconName = "info", extra = {}) {
   return Object.assign({ title, subtitle: subtitle || "", valid: false, icon: icon(iconName) }, extra);
 }
 
+// modifiers are disabled so ⌘↩ doesn't copy the internal arg and ⌥/⌃ don't run the action as a watchlist edit
 function actionItem(title, subtitle, action, arg, iconName, extra = {}) {
-  return Object.assign({ title, subtitle, arg, variables: { stocks_action: action }, icon: icon(iconName) }, extra);
+  const off = { arg: "", valid: false, subtitle };
+  return Object.assign({ title, subtitle, arg, variables: { stocks_action: action }, icon: icon(iconName), mods: { cmd: off, alt: off, ctrl: off } }, extra);
 }
 
 function errorItem(err, p) {
@@ -809,7 +821,7 @@ function quoteItem(q, t, inWatchlist, watchMode) {
   if (q.exchange) parts.push(q.exchange);
   if (q.low !== null && q.low !== undefined && q.high !== null && q.high !== undefined) parts.push(`Day ${fmtPrice(q.low, q.hint)} – ${fmtPrice(q.high, q.hint)}`);
   if (state) parts.push(STATE_LABEL[state]);
-  if (t - q.fetched > ttl(q, t) * 3) parts.push(`as of ${fmtTime(q.fetched)}`);
+  if (t - q.fetched > ttl(q, t) * 3) parts.push(`as of ${fmtTime(q.fetched, t)}`);
   const url = siteURL(q.symbol, q);
   const plain = fmtPrice(q.price, q.hint, false);
   const iconPath = q.spark && env("sparklines", "1") !== "0" && exists(q.spark) ? { path: q.spark } : icon(change === null || change === 0 ? "flat" : change > 0 ? "up" : "down");
@@ -864,8 +876,7 @@ function plainItem(sym, meta, inWatchlist, watchMode, subtitle) {
 function startRefresh(symbols) {
   if (env("STOCKS_SYNC", "0") === "1") {
     // test suite only: refresh in-process
-    const { error } = fetchQuotes(symbols);
-    setStatus(error);
+    fetchQuotes(symbols);
     return false;
   }
   writeFile(lockPath(), JSON.stringify({ started: now(), symbols }));
@@ -921,9 +932,12 @@ function searchItems(query) {
   const meta = {};
   for (const r of results) meta[r.symbol] = r;
   const symbols = results.map((r) => r.symbol);
-  // an exact ticker goes first; one the search doesn't know is still tried (last, so it doesn't use up
-  // a keyed plan's few quotes when the query was really a company name)
+  // An exact ticker goes first. One the search doesn't know is still tried: first when typed in
+  // capitals ("TWTR"), last when it's probably a name ("tesco"), so it doesn't use up a keyed plan's
+  // few quotes (Alpha Vantage quotes one result per search)
+  const q0 = query.trim();
   if (typedIsSymbol && meta[typed]) symbols.splice(0, symbols.length, typed, ...symbols.filter((s) => s !== typed));
+  else if (typedIsSymbol && q0 === q0.toUpperCase()) symbols.unshift(typed);
   else if (typedIsSymbol) symbols.push(typed);
   const wanted = symbols.slice(0, p.searchQuotes);
   let quotes = loadQuotes();
@@ -998,8 +1012,7 @@ function refresh(symbols) {
   $.setsid(); // leave Alfred's process group so a new keystroke doesn't kill the refresh
   writeFile(lockPath(), JSON.stringify({ started: now(), symbols, pid: $.NSProcessInfo.processInfo.processIdentifier }));
   try {
-    const { error } = fetchQuotes(cleanSymbols(symbols));
-    setStatus(error);
+    fetchQuotes(cleanSymbols(symbols));
   } finally {
     removeFile(lockPath());
   }
@@ -1019,8 +1032,9 @@ function act(arg) {
   const test = env("STOCKS_TEST_NOOPEN", "0") === "1"; // test suite only: don't launch apps
   switch (action) {
     case "open":
-      if (!/^(https:\/\/|stocks:\/\/)/.test(arg)) return "";
-      if (!test) $.NSWorkspace.sharedWorkspace.openURL($.NSURL.URLWithString(arg));
+      const url = /^(https:\/\/|stocks:\/\/)/.test(arg) ? $.NSURL.URLWithString(arg) : null;
+      if (!url || url.isNil()) return "";
+      if (!test) $.NSWorkspace.sharedWorkspace.openURL(url);
       return test ? `open ${arg}` : "";
     case "toggle":
     case "top": {

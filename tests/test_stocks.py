@@ -630,6 +630,94 @@ class ActionTests(Base):
         self.assertEqual(self.env.act("config", "config"), "config")
 
 
+class Audit1RegressionTests(Base):
+    """Bugs found in the first audit pass."""
+
+    def test_stale_market_open_flag_is_not_trusted_next_session(self):
+        # Twelve Data says is_market_open=false (fetched on Saturday); on Monday morning the stale
+        # cached quote must not say "Closed" while the market is open
+        self.env.set_key("twelvedata")
+        self.env.watchlist('{"symbols":["AAPL"]}')
+        self.env.items(provider="twelvedata")
+        Mock.fault = (500, b"down")
+        monday_open = NOW + 2 * 86400  # Monday 09:40 New York
+        it = self.env.items(provider="twelvedata", STOCKS_TEST_NOW=monday_open)
+        self.assertIn("Market open", it[1]["subtitle"])
+
+    def test_holiday_flag_still_used_within_the_session(self):
+        self.env.set_key("twelvedata")
+        monday_open = NOW + 2 * 86400
+        it = self.env.items("AAPL", provider="twelvedata", STOCKS_TEST_NOW=monday_open)
+        self.assertTrue(it[0]["subtitle"].endswith("Closed"), it[0]["subtitle"])  # is_market_open=false during hours
+
+    def test_quote_from_the_future_is_refetched(self):
+        self.env.items("AAPL", STOCKS_TEST_NOW=NOW + 86400)
+        n = len(Mock.requests)
+        self.env.items("AAPL")
+        self.assertGreater(len(Mock.requests), n)
+
+    def test_lowercase_name_query_quotes_results_first(self):
+        self.env.set_key("alphavantage")
+        Mock.overrides["alphavantage/quote_TSCO.LON"] = fixture("alphavantage/quote_IBM")
+        it = self.env.items("tesco", provider="alphavantage")
+        self.assertTrue(it[0]["title"].startswith("TSCO.LON   225.51"), it[0]["title"])
+        quoted = [urllib.parse.parse_qs(urllib.parse.urlparse(p).query)["symbol"][0] for p, _ in Mock.requests if "GLOBAL_QUOTE" in p]
+        self.assertEqual(quoted, ["TSCO.LON"])
+        it = self.env.items("IBM", provider="alphavantage")
+        self.assertTrue(it[0]["title"].startswith("IBM   225.51"))
+
+    def test_successful_search_clears_watchlist_error(self):
+        self.env.items()
+        Mock.fault = (429, b"Too Many Requests")
+        self.assertTrue(self.env.items(STOCKS_TEST_NOW=NOW + 3600)[0]["title"].startswith("Yahoo Finance: rate limited"))
+        Mock.fault = None
+        for sym in ("^GSPC", "^IXIC", "AAPL"):
+            self.env.items(sym, STOCKS_TEST_NOW=NOW + 3700)
+        it = self.env.items(STOCKS_TEST_NOW=NOW + 3710)
+        self.assertTrue(it[0]["title"].startswith("^GSPC"), it[0]["title"])
+
+    def test_as_of_shows_the_date_when_old(self):
+        self.env.items()
+        Mock.fault = (500, b"down")
+        it = self.env.items(STOCKS_TEST_NOW=NOW + 3 * 86400)
+        self.assertRegex(it[1]["subtitle"], r"as of Sep 26\b")
+
+    def test_negative_previous_close(self):
+        body = json.loads(fixture("yahoo/chart_AAPL")[1])
+        body["chart"]["result"][0]["meta"].update(regularMarketPrice=10.0, previousClose=-37.63, chartPreviousClose=-37.63)
+        Mock.overrides["yahoo/chart_" + safe("CL=F")] = (200, json.dumps(body).encode())
+        it = self.env.items("CL=F")
+        self.assertIn("▲ +47.63 (+126.57%)", it[0]["title"])
+
+    def test_invalid_utf8_body(self):
+        Mock.fault = (200, b"\xff\xfe\x00junk")
+        self.assertEqual(self.env.items("AAPL")[0]["title"], "Yahoo Finance: unexpected response (not JSON) (HTTP 200)")
+
+    def test_empty_search_results_expire_sooner(self):
+        self.env.items("zzzzqqqxx")
+        count = lambda: len([p for p, _ in Mock.requests if "/search" in p])
+        n = count()
+        self.env.items("zzzzqqqxx", STOCKS_TEST_NOW=NOW + 300)
+        self.assertEqual(count(), n)
+        self.env.items("zzzzqqqxx", STOCKS_TEST_NOW=NOW + 700)
+        self.assertEqual(count(), n + 1)
+
+    def test_action_rows_disable_modifiers(self):
+        for it in self.env.items(":"):
+            for m in ("cmd", "alt", "ctrl"):
+                self.assertIs(it["mods"][m]["valid"], False, it["title"])
+        Mock.fault = (403, b"no")
+        err = self.env.items("AAPL")[0]
+        self.assertIs(err["mods"]["cmd"]["valid"], False)
+
+    def test_http_400_quote_is_unknown_symbol(self):
+        Mock.overrides["yahoo/chart_AAPL"] = (400, b'{"chart":{"result":null,"error":{"code":"Bad Request","description":"Invalid symbol"}}}')
+        self.assertEqual(self.env.items("AAPL")[0]["title"], "No data for AAPL")
+
+    def test_open_rejects_unparseable_url(self):
+        self.assertEqual(self.env.act("open", "https://exa mple.com/<>"), "")
+
+
 class PlistTests(unittest.TestCase):
     def test_build_and_plist(self):
         subprocess.run([sys.executable, "tools/build.py"], cwd=ROOT, check=True, capture_output=True)
