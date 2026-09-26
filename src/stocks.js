@@ -147,7 +147,9 @@ function httpMany(reqs, parallel = 8) {
   const t = Date.now() / 1000;
   for (const f of listDir(cacheDir())) if (f.startsWith("tmp-") && t - mtime(`${cacheDir()}/${f}`) > 120) FM.removeItemAtPathError(`${cacheDir()}/${f}`, $());
   const dir = mkdirs(`${cacheDir()}/tmp-${$.NSUUID.UUID.UUIDString.js}`);
-  const lines = parallel > 1 ? ["parallel", `parallel-max = ${parallel}`] : [];
+  // parallel-immediate: without it curl waits to multiplex on one connection, which serialises the
+  // requests to an HTTP/1.1 server (8 slow quotes: 8 × the timeout instead of 1 ×)
+  const lines = parallel > 1 ? ["parallel", "parallel-immediate", `parallel-max = ${parallel}`] : [];
   reqs.forEach((r, i) => {
     if (i) lines.push("next");
     lines.push(`url = ${cfg(r.url)}`, `output = ${cfg(`${dir}/${i}`)}`, "silent", "compressed",
@@ -1096,20 +1098,22 @@ function watchlistItems() {
   // after a failure, wait before trying again: with rerun this would otherwise hammer a rate-limited API
   const backoff = backingOff(lastError());
   const last = readJSON(lastRefreshPath(), {});
-  const tooSoon = p.gap && last.provider === p.id && t >= last.at && t - last.at < p.gap;
+  const tooSoon = !!p.gap && last.provider === p.id && t >= last.at && t - last.at < p.gap;
   if (stale.length && !running && !backoff && !tooSoon) {
     running = startRefresh(stale.slice(0, p.batch || MAX_WATCHLIST));
     quotes = loadQuotes();
   }
+  // the next batch is due once the provider's per-minute budget allows it
+  const waiting = !running && !backoff && tooSoon && stale.length > 0;
   const err = lastError();
   if (err && !running) items.push(errorItem(err, p));
   for (const s of wl.symbols) {
     const q = quotes[s];
     if (q && !q.missing) items.push(quoteItem(q, t, true, true));
     else if (q && q.missing) items.push(plainItem(s, null, true, true, q.plan ? `Not available on your ${p.name} plan` : `No data from ${p.name}: unknown or delisted symbol`));
-    else items.push(plainItem(s, null, true, true, running ? "Loading…" : "No quote yet"));
+    else items.push(plainItem(s, null, true, true, running || waiting ? "Loading…" : "No quote yet"));
   }
-  return running ? { items, rerun: 0.5 } : { items };
+  return running ? { items, rerun: 0.5 } : waiting ? { items, rerun: 5 } : { items };
 }
 
 function searchItems(query) {
@@ -1141,6 +1145,9 @@ function searchItems(query) {
   const stale = wanted.filter((s) => !fresh(quotes[s], t));
   // a rate limit or rejected key applies to every request; after a failed search (Yahoo: another
   // endpoint) a typed ticker is still quoted
+  const st = lastError();
+  if (!error && stale.length && p.needsKey && st && st.kind === "rate" && backingOff(st))
+    error = Object.assign(new ProviderError("rate", st.message, st.status), { recorded: true }); // cached search, but quotes would hit the limit
   const blocked = error && (["auth", "nokey", "network"].includes(error.kind) || (error.kind === "rate" && p.needsKey));
   if (error && !error.recorded && ["rate", "auth"].includes(error.kind)) setStatus(error); // not again: that would extend the back-off
   if (stale.length && !blocked) {

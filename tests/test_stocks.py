@@ -94,6 +94,8 @@ class Mock(BaseHTTPRequestHandler):
         self.send(*(Mock.overrides.get(name) or fixture(name) or default))
 
 
+ThreadingHTTPServer.request_queue_size = 64  # curl opens up to 8 connections at once
+ThreadingHTTPServer.daemon_threads = True
 SERVER = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
 threading.Thread(target=SERVER.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{SERVER.server_port}"
@@ -860,6 +862,13 @@ class Audit4RegressionTests(Base):
         self.lock(started=NOW + 86400)
         self.assertTrue(self.env.items()[0]["title"].startswith("^GSPC   7,743.41"))
 
+    def test_requests_really_run_in_parallel(self):
+        Mock.fault = "slow"  # 3 s per request
+        self.env.watchlist(json.dumps({"symbols": [f"S{i}" for i in range(6)]}))
+        t = time.time()
+        self.env.items(STOCKS_TIMEOUT=5)
+        self.assertLess(time.time() - t, 8)  # was 6 × 3 s: curl queued them on one HTTP/1.1 connection
+
     # --- keyed providers: per-symbol plan limits and budgets
     def test_symbol_outside_the_plan_is_not_a_key_error(self):
         self.env.set_key("finnhub")
@@ -889,10 +898,23 @@ class Audit4RegressionTests(Base):
         count = lambda: len([p for p, _ in Mock.requests if p.startswith("/quote")])
         self.env.items(provider="twelvedata")
         self.assertEqual(count(), 8)  # 8 credits a minute
-        self.env.items(provider="twelvedata", STOCKS_TEST_NOW=NOW + 30)
+        data = self.env.sf(provider="twelvedata", STOCKS_TEST_NOW=NOW + 30)
         self.assertEqual(count(), 8)
+        self.assertEqual(data["rerun"], 5)  # comes back for the rest when the minute is up
+        self.assertEqual(data["items"][-1]["subtitle"], "Loading…")
         self.env.items(provider="twelvedata", STOCKS_TEST_NOW=NOW + 61)
         self.assertEqual(count(), 12)  # the 4 never fetched
+
+    def test_cached_search_does_not_spend_a_daily_limit(self):
+        self.env.set_key("alphavantage")
+        self.env.items("tesco", provider="alphavantage")  # search cached
+        Mock.overrides["alphavantage/quote_IBM"] = fixture("alphavantage/ratelimit_information")
+        self.env.items("IBM", provider="alphavantage")
+        os.remove(os.path.join(self.env.cache, "quotes.json"))  # the quote is needed again, the search is cached
+        n = len(Mock.requests)
+        it = self.env.items("tesco", provider="alphavantage", STOCKS_TEST_NOW=NOW + 60)
+        self.assertEqual(len(Mock.requests), n)
+        self.assertTrue(it[0]["title"].startswith("Alpha Vantage: daily limit"))
 
     def test_search_failure_does_not_poison_the_watchlist(self):
         self.env.items()
