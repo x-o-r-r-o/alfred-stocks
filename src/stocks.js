@@ -21,9 +21,15 @@ const CLOSED_TTL = 15 * 60; // …and while it is closed
 const MISSING_TTL = 60 * 60; // remember unknown symbols for an hour
 const SEARCH_TTL = 24 * 60 * 60;
 const EMPTY_SEARCH_TTL = 10 * 60; // an empty answer may be a glitch: ask again sooner
+const RETRY_AFTER = 60; // seconds before the watchlist retries after a failed refresh
 const LOCK_TTL = 30; // a refresh lock older than this is considered dead
 const MAX_WATCHLIST = 50;
 const SYMBOL_RE = /^[A-Z0-9^][A-Z0-9.^=\-:\/_&]{0,31}$/;
+
+// Alfred checkboxes arrive as "1"/"0" (older versions: "true"/"false")
+function enabled(name, fallback) {
+  return !/^(0|false|no|)$/i.test(env(name, fallback ? "1" : "0").trim());
+}
 
 function now() {
   const t = env("STOCKS_TEST_NOW", null); // test suite only: fixed clock (epoch seconds)
@@ -130,6 +136,9 @@ function cfg(s) {
 // stdin, so nothing secret shows up in the process list. Returns [{status, body, exit, error}].
 function httpMany(reqs) {
   if (!reqs.length) return [];
+  // Alfred kills a running Script Filter when the query changes: remove what such runs left behind
+  const t = Date.now() / 1000;
+  for (const f of listDir(cacheDir())) if (f.startsWith("tmp-") && t - mtime(`${cacheDir()}/${f}`) > 120) FM.removeItemAtPathError(`${cacheDir()}/${f}`, $());
   const dir = mkdirs(`${cacheDir()}/tmp-${$.NSUUID.UUID.UUIDString.js}`);
   const lines = ["parallel", "parallel-max = 8"];
   reqs.forEach((r, i) => {
@@ -204,6 +213,15 @@ function num(v) {
 function str(v) {
   return typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "";
 }
+// company names sometimes arrive HTML-escaped ("Procter &amp; Gamble")
+function name(v) {
+  const ents = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+  return str(v).replace(/&(#x[0-9a-f]{1,6}|#\d{1,7}|[a-z]{2,5});/gi, (m, e) => {
+    if (e[0] !== "#") return ents[e.toLowerCase()] || m;
+    const n = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+    return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : m;
+  });
+}
 
 // ---------- market state ----------
 
@@ -257,7 +275,7 @@ const PROVIDERS = {
       if (!Array.isArray(v.quotes)) throw new ProviderError("parse", "unexpected search response");
       return v.quotes
         .filter((x) => x && typeof x.symbol === "string" && x.isYahooFinance !== false && x.quoteType !== "OPTION")
-        .map((x) => ({ symbol: x.symbol.toUpperCase(), name: str(x.longname) || str(x.shortname), exchange: str(x.exchDisp) || str(x.exchange), type: str(x.typeDisp) || str(x.quoteType) }));
+        .map((x) => ({ symbol: x.symbol.toUpperCase(), name: name(x.longname) || name(x.shortname), exchange: str(x.exchDisp) || str(x.exchange), type: str(x.typeDisp) || str(x.quoteType) }));
     },
     quoteReq(sym) {
       return { url: `${this.base()}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`, ua: YAHOO_UA };
@@ -280,7 +298,7 @@ const PROVIDERS = {
       const period = (x) => (x && num(x.start) !== null && num(x.end) !== null ? { start: num(x.start), end: num(x.end) } : null);
       return {
         symbol: sym,
-        name: str(m.longName) || str(m.shortName),
+        name: name(m.longName) || name(m.shortName),
         price,
         prev: num(m.previousClose) !== null ? num(m.previousClose) : num(m.chartPreviousClose),
         low: num(m.regularMarketDayLow) !== null ? num(m.regularMarketDayLow) : series.length ? Math.min(...series) : null,
@@ -312,7 +330,7 @@ const PROVIDERS = {
       if (!Array.isArray(v.result)) throw new ProviderError("parse", "unexpected search response");
       return v.result
         .filter((x) => x && typeof x.symbol === "string")
-        .map((x) => ({ symbol: x.symbol.toUpperCase(), name: str(x.description), exchange: "", type: str(x.type) }));
+        .map((x) => ({ symbol: x.symbol.toUpperCase(), name: name(x.description), exchange: "", type: str(x.type) }));
     },
     quoteReq(sym, key) {
       return { url: `${this.base()}/quote?symbol=${encodeURIComponent(sym)}`, headers: { "X-Finnhub-Token": key } };
@@ -352,7 +370,7 @@ const PROVIDERS = {
       if (!Array.isArray(v.bestMatches)) throw new ProviderError("parse", "unexpected search response");
       return v.bestMatches
         .filter((x) => x && typeof x["1. symbol"] === "string")
-        .map((x) => ({ symbol: x["1. symbol"].toUpperCase(), name: str(x["2. name"]), exchange: str(x["4. region"]), type: str(x["3. type"]), currency: str(x["8. currency"]) }));
+        .map((x) => ({ symbol: x["1. symbol"].toUpperCase(), name: name(x["2. name"]), exchange: str(x["4. region"]), type: str(x["3. type"]), currency: str(x["8. currency"]) }));
     },
     quoteReq(sym, key) {
       return { url: `${this.base()}/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(sym)}&apikey=${encodeURIComponent(key)}` };
@@ -396,7 +414,7 @@ const PROVIDERS = {
       if (!Array.isArray(v.data)) throw new ProviderError("parse", "unexpected search response");
       return v.data
         .filter((x) => x && typeof x.symbol === "string")
-        .map((x) => ({ symbol: x.symbol.toUpperCase(), name: str(x.instrument_name), exchange: str(x.exchange), type: str(x.instrument_type), currency: str(x.currency) }));
+        .map((x) => ({ symbol: x.symbol.toUpperCase(), name: name(x.instrument_name), exchange: str(x.exchange), type: str(x.instrument_type), currency: str(x.currency) }));
     },
     quoteReq(sym, key) {
       return { url: `${this.base()}/quote?symbol=${encodeURIComponent(sym)}`, headers: { Authorization: `apikey ${key}` } };
@@ -407,7 +425,7 @@ const PROVIDERS = {
       if (price === null) return null;
       const us = /^(NASDAQ|NYSE|AMEX|NYSE ARCA|BATS|CBOE)$/i.test(str(v.exchange));
       const q = {
-        symbol: sym, name: str(v.name), price, prev: num(v.previous_close), change: num(v.change), pct: num(v.percent_change),
+        symbol: sym, name: name(v.name), price, prev: num(v.previous_close), change: num(v.change), pct: num(v.percent_change),
         low: num(v.low), high: num(v.high), currency: str(v.currency), exchange: str(v.exchange), type: "",
         time: num(v.last_quote_at) !== null ? num(v.last_quote_at) : num(v.timestamp),
       };
@@ -521,8 +539,8 @@ function changes(q) {
 }
 
 function oneLine(s, max = 80) {
-  const t = String(s || "").replace(/\s+/g, " ").trim();
-  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+  const t = Array.from(String(s || "").replace(/\s+/g, " ").trim()); // code points: never split an emoji
+  return t.length > max ? t.slice(0, max - 1).join("") + "…" : t.join("");
 }
 
 // ---------- open in… ----------
@@ -673,7 +691,7 @@ function fetchQuotes(symbols, names = {}) {
   const resps = httpMany(symbols.map((s) => p.quoteReq(s, key)));
   const t = now(), old = loadQuotes(), entries = {};
   let error = null;
-  const sparks = env("sparklines", "1") !== "0";
+  const sparks = enabled("sparklines", true);
   resps.forEach((r, i) => {
     const sym = symbols[i];
     try {
@@ -824,7 +842,7 @@ function quoteItem(q, t, inWatchlist, watchMode) {
   if (t - q.fetched > ttl(q, t) * 3) parts.push(`as of ${fmtTime(q.fetched, t)}`);
   const url = siteURL(q.symbol, q);
   const plain = fmtPrice(q.price, q.hint, false);
-  const iconPath = q.spark && env("sparklines", "1") !== "0" && exists(q.spark) ? { path: q.spark } : icon(change === null || change === 0 ? "flat" : change > 0 ? "up" : "down");
+  const iconPath = q.spark && enabled("sparklines", true) && exists(q.spark) ? { path: q.spark } : icon(change === null || change === 0 ? "flat" : change > 0 ? "up" : "down");
   const title = `${q.symbol}   ${price}${cur}   ${arrow}${fmtChange(change, q.price, q.hint)} (${fmtPct(pct)})`;
   const item = {
     title,
@@ -901,7 +919,10 @@ function watchlistItems() {
   let quotes = loadQuotes();
   const stale = wl.symbols.filter((s) => !fresh(quotes[s], t));
   let running = refreshRunning();
-  if (stale.length && !running) {
+  const err0 = lastError();
+  // after a failure, wait before trying again: with rerun this would otherwise hammer a rate-limited API
+  const backoff = err0 && t - err0.at >= 0 && t - err0.at < RETRY_AFTER;
+  if (stale.length && !running && !backoff) {
     running = startRefresh(stale);
     quotes = loadQuotes();
   }
@@ -1041,29 +1062,28 @@ function act(arg) {
       const sym = arg.trim().toUpperCase();
       if (!SYMBOL_RE.test(sym)) return "Not a valid symbol";
       const list = loadWatchlist().symbols;
-      let msg;
+      let msg, next;
       if (action === "top") {
-        saveWatchlist([sym, ...list.filter((s) => s !== sym)]);
+        next = [sym, ...list.filter((s) => s !== sym)];
         msg = `Moved ${sym} to the top of the watchlist`;
       } else if (list.includes(sym)) {
-        saveWatchlist(list.filter((s) => s !== sym));
+        next = list.filter((s) => s !== sym);
         msg = `Removed ${sym} from the watchlist`;
       } else if (list.length >= MAX_WATCHLIST) {
         return `The watchlist is full (${MAX_WATCHLIST} symbols)`;
       } else {
-        saveWatchlist([...list, sym]);
+        next = [...list, sym];
         msg = `Added ${sym} to the watchlist`;
       }
+      if (!saveWatchlist(next)) return "Could not save the watchlist";
       if (env("stocks_reopen", "0") === "1" && !test) reopen();
       return msg;
     }
     case "restore":
-      saveWatchlist(arg === "-" ? [] : arg.split(/\s+/));
-      return "Watchlist repaired";
+      return saveWatchlist(arg === "-" ? [] : arg.split(/\s+/)) ? "Watchlist repaired" : "Could not save the watchlist";
     case "reset": {
       if (exists(watchlistPath())) FM.copyItemAtPathToPathError(watchlistPath(), `${watchlistPath()}.backup-${Math.round(Date.now() / 1000)}`, $());
-      saveWatchlist(defaultWatchlist());
-      return "Watchlist reset";
+      return saveWatchlist(defaultWatchlist()) ? "Watchlist reset" : "Could not save the watchlist";
     }
     case "clearcache":
       for (const f of [quotesPath(), searchPath(), statusPath()]) removeFile(f);

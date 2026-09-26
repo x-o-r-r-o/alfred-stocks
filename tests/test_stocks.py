@@ -663,8 +663,11 @@ class Audit1RegressionTests(Base):
         self.assertTrue(it[0]["title"].startswith("TSCO.LON   225.51"), it[0]["title"])
         quoted = [urllib.parse.parse_qs(urllib.parse.urlparse(p).query)["symbol"][0] for p, _ in Mock.requests if "GLOBAL_QUOTE" in p]
         self.assertEqual(quoted, ["TSCO.LON"])
-        it = self.env.items("IBM", provider="alphavantage")
-        self.assertTrue(it[0]["title"].startswith("IBM   225.51"))
+        # a ticker typed in capitals that the search doesn't list exactly is quoted first
+        Mock.overrides["alphavantage/search_tsco"] = fixture("alphavantage/search_tesco")
+        Mock.overrides["alphavantage/quote_TSCO"] = fixture("alphavantage/quote_IBM")
+        it = self.env.items("TSCO", provider="alphavantage")
+        self.assertTrue(it[0]["title"].startswith("TSCO   225.51"), it[0]["title"])
 
     def test_successful_search_clears_watchlist_error(self):
         self.env.items()
@@ -716,6 +719,74 @@ class Audit1RegressionTests(Base):
 
     def test_open_rejects_unparseable_url(self):
         self.assertEqual(self.env.act("open", "https://exa mple.com/<>"), "")
+
+
+class Audit2RegressionTests(Base):
+    """Bugs found in the second audit pass."""
+
+    def test_failed_refresh_backs_off(self):
+        Mock.fault = (429, b"Too Many Requests")
+        it = self.env.items()
+        self.assertTrue(it[0]["title"].startswith("Yahoo Finance: rate limited"))
+        n = len(Mock.requests)
+        it = self.env.items(STOCKS_TEST_NOW=NOW + 30)
+        self.assertEqual(len(Mock.requests), n)  # no new attempt (and no rerun loop) for a minute
+        self.assertTrue(it[0]["title"].startswith("Yahoo Finance: rate limited"))
+        self.assertEqual(it[1]["subtitle"], "No quote yet")
+        self.env.items(STOCKS_TEST_NOW=NOW + 61)
+        self.assertGreater(len(Mock.requests), n)
+
+    def test_background_refresh_does_not_loop_on_errors(self):
+        Mock.fault = (500, b"down")
+        self.env.sf(STOCKS_SYNC="0")
+        lock = os.path.join(self.env.cache, "refresh.lock")
+        for _ in range(100):
+            if not os.path.exists(lock):
+                break
+            time.sleep(0.1)
+        n = len(Mock.requests)
+        data = self.env.sf(STOCKS_SYNC="0")
+        self.assertNotIn("rerun", data)
+        self.assertEqual(len(Mock.requests), n)
+        self.assertEqual(data["items"][0]["title"], "Yahoo Finance: server error (HTTP 500)")
+
+    def test_leftover_temp_dirs_are_removed(self):
+        old = os.path.join(self.env.cache, "tmp-dead")
+        new = os.path.join(self.env.cache, "tmp-busy")
+        os.makedirs(old)
+        os.makedirs(new)
+        os.utime(old, (time.time() - 600, time.time() - 600))
+        self.env.items("AAPL")
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+
+    def test_long_unicode_name_not_cut_inside_an_emoji(self):
+        body = json.loads(fixture("yahoo/chart_AAPL")[1])
+        body["chart"]["result"][0]["meta"]["longName"] = "A" * 48 + "🚀🚀🚀 Ünïcødé"
+        Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps(body).encode())
+        sub = self.env.items("AAPL")[0]["subtitle"]
+        sub.encode("utf-8")  # raises on a lone surrogate
+        self.assertTrue(sub.startswith("A" * 48 + "🚀…"), sub)
+
+    def test_html_entities_in_names(self):
+        Mock.overrides["yahoo/search_procter"] = (200, json.dumps({"quotes": [
+            {"symbol": "GJR", "shortname": "Synthetic", "longname": "Strats Trust For Procter &amp; Gambel &#233;&#x1F600; &bogus;",
+             "quoteType": "EQUITY", "exchDisp": "NYSE", "isYahooFinance": True}]}).encode())
+        it = self.env.items("procter")
+        self.assertEqual(it[0]["title"], "GJR   Strats Trust For Procter & Gambel é😀 &bogus;")
+
+    def test_checkbox_false_string(self):
+        self.assertEqual(self.env.items("AAPL", sparklines="false")[0]["icon"]["path"], "icons/up.png")
+
+    def test_watchlist_write_failure_is_reported(self):
+        self.env.watchlist('{"symbols":["AAPL"]}')
+        os.chmod(self.env.data, 0o500)
+        try:
+            self.assertEqual(self.env.act("toggle", "TSLA"), "Could not save the watchlist")
+            self.assertEqual(self.env.act("reset", "reset"), "Could not save the watchlist")
+        finally:
+            os.chmod(self.env.data, 0o700)
+        self.assertEqual(self.env.watchlist(), ["AAPL"])
 
 
 class PlistTests(unittest.TestCase):
