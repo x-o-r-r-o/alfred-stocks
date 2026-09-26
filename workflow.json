@@ -1,0 +1,118 @@
+{
+  "bundleid": "io.github.x-o-r-r-o.stocks",
+  "name": "Stocks",
+  "description": "Stock, crypto and currency quotes with a watchlist and sparklines",
+  "category": "Internet",
+  "createdby": "x-o-r-r-o",
+  "webaddress": "https://github.com/x-o-r-r-o/alfred-stocks",
+  "version": "1.0.0",
+  "variablesdontexport": [],
+  "config": [
+    {
+      "type": "textfield",
+      "variable": "keyword_stock",
+      "label": "Keyword",
+      "description": "Watchlist, quotes and ticker search",
+      "config": {
+        "default": "stock",
+        "placeholder": "stock",
+        "required": true,
+        "trim": true
+      }
+    },
+    {
+      "type": "popupbutton",
+      "variable": "provider",
+      "label": "Data provider",
+      "description": "Yahoo Finance needs no key but is unofficial and may break or rate-limit. The others need a free API key: set it with “:key” after the keyword.",
+      "config": {
+        "default": "yahoo",
+        "pairs": [
+          ["Yahoo Finance (no key, unofficial)", "yahoo"],
+          ["Finnhub (API key)", "finnhub"],
+          ["Twelve Data (API key)", "twelvedata"],
+          ["Alpha Vantage (API key, 25 requests a day)", "alphavantage"]
+        ]
+      }
+    },
+    {
+      "type": "popupbutton",
+      "variable": "open_in",
+      "label": "Open quotes in (↩)",
+      "description": "",
+      "config": {
+        "default": "yahoo",
+        "pairs": [
+          ["Yahoo Finance", "yahoo"],
+          ["Google Finance", "google"],
+          ["TradingView", "tradingview"],
+          ["Stocks app", "stocks"]
+        ]
+      }
+    },
+    {
+      "type": "textfield",
+      "variable": "number_locale",
+      "label": "Number format",
+      "description": "A locale such as en-US, de-DE or fr-CH. Leave empty to use the system’s format.",
+      "config": {
+        "default": "",
+        "placeholder": "System",
+        "required": false,
+        "trim": true
+      }
+    },
+    {
+      "type": "checkbox",
+      "variable": "sparklines",
+      "label": "Icons",
+      "description": "",
+      "config": {
+        "default": true,
+        "required": false,
+        "text": "Show intraday sparklines (Yahoo Finance)"
+      }
+    }
+  ],
+  "objects": [
+    {
+      "id": "sf_stock",
+      "type": "scriptfilter",
+      "keyword": "{var:keyword_stock}",
+      "title": "Stocks",
+      "subtext": "Your watchlist, or type a ticker or company",
+      "script": "osascript -l JavaScript ./stocks.js filter \"$1\"",
+      "queuedelaymode": 1,
+      "running": "Fetching quotes…"
+    },
+    {
+      "id": "ua_text",
+      "type": "universalaction",
+      "name": "Look up stock quote",
+      "text": true
+    },
+    {
+      "id": "act",
+      "type": "script",
+      "script": "osascript -l JavaScript ./stocks.js act \"$1\"",
+      "note": "Open, watchlist edits, API key, cache"
+    },
+    {
+      "id": "copy",
+      "type": "clipboard",
+      "autopaste": false
+    },
+    {
+      "id": "notify",
+      "type": "notification"
+    }
+  ],
+  "connections": [
+    { "from": "ua_text", "to": "sf_stock" },
+    { "from": "sf_stock", "to": "act" },
+    { "from": "sf_stock", "to": "act", "mod": "alt" },
+    { "from": "sf_stock", "to": "act", "mod": "ctrl" },
+    { "from": "sf_stock", "to": "copy", "mod": "cmd" },
+    { "from": "act", "to": "notify" }
+  ]
+}

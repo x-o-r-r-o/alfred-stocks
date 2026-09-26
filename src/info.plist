@@ -5,48 +5,293 @@
 	<key>bundleid</key>
 	<string>io.github.x-o-r-r-o.stocks</string>
 	<key>category</key>
-	<string>Productivity</string>
+	<string>Internet</string>
 	<key>connections</key>
-	<dict/>
+	<dict>
+		<key>0B72D798-E761-506A-AFAC-FA1B954DBBF4</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>5F398622-19D9-53C5-960A-B54BB4CC8F21</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+		<key>5F398622-19D9-53C5-960A-B54BB4CC8F21</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>74702504-571F-5F96-BD78-C6E261E0551B</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>74702504-571F-5F96-BD78-C6E261E0551B</string>
+				<key>modifiers</key>
+				<integer>524288</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>74702504-571F-5F96-BD78-C6E261E0551B</string>
+				<key>modifiers</key>
+				<integer>262144</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>53800D5E-5D84-5299-9E1D-D65C18F7C840</string>
+				<key>modifiers</key>
+				<integer>1048576</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+		<key>74702504-571F-5F96-BD78-C6E261E0551B</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>4DF8B965-5604-5738-BA40-D0D5677FBFB6</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+	</dict>
 	<key>createdby</key>
 	<string>x-o-r-r-o</string>
 	<key>description</key>
-	<string>Watchlist quotes and quick ticker lookup.</string>
+	<string>Stock, crypto and currency quotes with a watchlist and sparklines</string>
+	<key>disabled</key>
+	<false/>
 	<key>name</key>
 	<string>Stocks</string>
 	<key>objects</key>
-	<array/>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>alfredfiltersresults</key>
+				<false/>
+				<key>alfredfiltersresultsmatchmode</key>
+				<integer>0</integer>
+				<key>argumenttreatemptyqueryasnil</key>
+				<false/>
+				<key>argumenttrimmode</key>
+				<integer>0</integer>
+				<key>argumenttype</key>
+				<integer>1</integer>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>keyword</key>
+				<string>{var:keyword_stock}</string>
+				<key>queuedelaycustom</key>
+				<integer>3</integer>
+				<key>queuedelayimmediatelyinitially</key>
+				<true/>
+				<key>queuedelaymode</key>
+				<integer>1</integer>
+				<key>queuemode</key>
+				<integer>1</integer>
+				<key>runningsubtext</key>
+				<string>Fetching quotes…</string>
+				<key>script</key>
+				<string>osascript -l JavaScript ./stocks.js filter "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>skipuniversalaction</key>
+				<true/>
+				<key>subtext</key>
+				<string>Your watchlist, or type a ticker or company</string>
+				<key>title</key>
+				<string>Stocks</string>
+				<key>type</key>
+				<integer>0</integer>
+				<key>withspace</key>
+				<true/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.input.scriptfilter</string>
+			<key>uid</key>
+			<string>5F398622-19D9-53C5-960A-B54BB4CC8F21</string>
+			<key>version</key>
+			<integer>3</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>acceptsfiles</key>
+				<false/>
+				<key>acceptsmulti</key>
+				<integer>0</integer>
+				<key>acceptstext</key>
+				<true/>
+				<key>acceptsurls</key>
+				<false/>
+				<key>name</key>
+				<string>Look up stock quote</string>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.trigger.universalaction</string>
+			<key>uid</key>
+			<string>0B72D798-E761-506A-AFAC-FA1B954DBBF4</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>script</key>
+				<string>osascript -l JavaScript ./stocks.js act "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>0</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>74702504-571F-5F96-BD78-C6E261E0551B</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>autopaste</key>
+				<false/>
+				<key>clipboardtext</key>
+				<string>{query}</string>
+				<key>ignoredynamicplaceholders</key>
+				<true/>
+				<key>transient</key>
+				<false/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.output.clipboard</string>
+			<key>uid</key>
+			<string>53800D5E-5D84-5299-9E1D-D65C18F7C840</string>
+			<key>version</key>
+			<integer>3</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>lastpathcomponent</key>
+				<false/>
+				<key>onlyshowifquerypopulated</key>
+				<true/>
+				<key>removeextension</key>
+				<false/>
+				<key>text</key>
+				<string>{query}</string>
+				<key>title</key>
+				<string>{var:alfred_workflow_name}</string>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.output.notification</string>
+			<key>uid</key>
+			<string>4DF8B965-5604-5738-BA40-D0D5677FBFB6</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+	</array>
 	<key>readme</key>
-	<string># Stocks
+	<string>## Usage
 
-Watchlist quotes and quick ticker lookup.
+See your watchlist via the `stock` keyword. Each row shows the price, the change since the previous close (▲ up, ▼ down), the day range and whether the market is open, with the day’s chart as its icon. Quotes appear instantly from the cache and refresh in the background.
 
-&gt; **Status:** planned — not yet functional. See [PLAN.md](PLAN.md).
+Look up a quote by typing a ticker or company name after the keyword, like `stock apple`, `stock BTC-USD` or `stock EURUSD=X`.
 
-## Usage
+Alternatively, look up selected text via the Universal Action.
 
-Watchlist quotes and quick ticker lookup via the `stock` keyword.
+* &lt;kbd&gt;↩&lt;/kbd&gt; Open the quote in Yahoo Finance, Google Finance, TradingView or the Stocks app, as set in the Workflow’s Configuration.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Copy the price.
+* &lt;kbd&gt;⌥&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Add to or remove from the watchlist.
+* &lt;kbd&gt;⌃&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Move to the top of the watchlist.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;Y&lt;/kbd&gt; Quick Look the quote page.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;L&lt;/kbd&gt; Show the quote in Large Type.
 
-![Stocks results in Alfred](images/stock.png)
+Type `:` after the keyword for more: `:reset` restores the default watchlist, `:cache` clears cached quotes and `:config` opens the Workflow’s Configuration.
 
-* &lt;kbd&gt;↩&lt;/kbd&gt; Primary action.
-* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Secondary action.
-* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;Y&lt;/kbd&gt; Quick Look.
+### Data providers
+
+Yahoo Finance is used by default and needs no account. Its API is unofficial and can change or block requests without notice (that is how the older Alfred stock workflows broke), so the workflow tells you when a provider fails. Pick Finnhub, Twelve Data or Alpha Vantage in the Workflow’s Configuration instead, then save a free API key with `:key` followed by the key via the `stock` keyword. Keys are stored in the macOS Keychain.
+
+Symbols follow each provider’s conventions: Yahoo Finance uses `^GSPC`, `BTC-USD`, `EURUSD=X` and exchange suffixes like `7203.T`; Finnhub uses `BINANCE:BTCUSDT`; Twelve Data uses `BTC/USD` and `EUR/USD`. Sparklines are drawn for Yahoo Finance quotes only. The free plans of the keyed providers mostly cover US markets and have tight limits (Alpha Vantage allows 25 requests a day).
+
+Quotes may be delayed and are for information only: this is not financial advice, and the workflow can’t trade.
 
 Every keyword can be changed in the Workflow’s Configuration.
-
-## Development
-
-```bash
-./build.sh   # -&gt; dist/alfred-stocks-&lt;version&gt;.alfredworkflow
-```
-
-## AI disclosure
-
-This workflow is developed with the help of Claude (Anthropic), an AI assistant. All code is reviewed and tested by the author.
 </string>
 	<key>uidata</key>
-	<dict/>
+	<dict>
+		<key>0B72D798-E761-506A-AFAC-FA1B954DBBF4</key>
+		<dict>
+			<key>xpos</key>
+			<integer>30</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+		<key>4DF8B965-5604-5738-BA40-D0D5677FBFB6</key>
+		<dict>
+			<key>xpos</key>
+			<integer>690</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+		<key>53800D5E-5D84-5299-9E1D-D65C18F7C840</key>
+		<dict>
+			<key>xpos</key>
+			<integer>470</integer>
+			<key>ypos</key>
+			<integer>150</integer>
+		</dict>
+		<key>5F398622-19D9-53C5-960A-B54BB4CC8F21</key>
+		<dict>
+			<key>xpos</key>
+			<integer>250</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+		<key>74702504-571F-5F96-BD78-C6E261E0551B</key>
+		<dict>
+			<key>note</key>
+			<string>Open, watchlist edits, API key, cache</string>
+			<key>xpos</key>
+			<integer>470</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+	</dict>
 	<key>userconfigurationconfig</key>
 	<array>
 		<dict>
@@ -62,17 +307,129 @@ This workflow is developed with the help of Claude (Anthropic), an AI assistant.
 				<true/>
 			</dict>
 			<key>description</key>
-			<string></string>
+			<string>Watchlist, quotes and ticker search</string>
 			<key>label</key>
-			<string>Stock keyword</string>
+			<string>Keyword</string>
 			<key>type</key>
 			<string>textfield</string>
 			<key>variable</key>
 			<string>keyword_stock</string>
 		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>yahoo</string>
+				<key>pairs</key>
+				<array>
+					<array>
+						<string>Yahoo Finance (no key, unofficial)</string>
+						<string>yahoo</string>
+					</array>
+					<array>
+						<string>Finnhub (API key)</string>
+						<string>finnhub</string>
+					</array>
+					<array>
+						<string>Twelve Data (API key)</string>
+						<string>twelvedata</string>
+					</array>
+					<array>
+						<string>Alpha Vantage (API key, 25 requests a day)</string>
+						<string>alphavantage</string>
+					</array>
+				</array>
+			</dict>
+			<key>description</key>
+			<string>Yahoo Finance needs no key but is unofficial and may break or rate-limit. The others need a free API key: set it with “:key” after the keyword.</string>
+			<key>label</key>
+			<string>Data provider</string>
+			<key>type</key>
+			<string>popupbutton</string>
+			<key>variable</key>
+			<string>provider</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>yahoo</string>
+				<key>pairs</key>
+				<array>
+					<array>
+						<string>Yahoo Finance</string>
+						<string>yahoo</string>
+					</array>
+					<array>
+						<string>Google Finance</string>
+						<string>google</string>
+					</array>
+					<array>
+						<string>TradingView</string>
+						<string>tradingview</string>
+					</array>
+					<array>
+						<string>Stocks app</string>
+						<string>stocks</string>
+					</array>
+				</array>
+			</dict>
+			<key>description</key>
+			<string></string>
+			<key>label</key>
+			<string>Open quotes in (↩)</string>
+			<key>type</key>
+			<string>popupbutton</string>
+			<key>variable</key>
+			<string>open_in</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string></string>
+				<key>placeholder</key>
+				<string>System</string>
+				<key>required</key>
+				<false/>
+				<key>trim</key>
+				<true/>
+			</dict>
+			<key>description</key>
+			<string>A locale such as en-US, de-DE or fr-CH. Leave empty to use the system’s format.</string>
+			<key>label</key>
+			<string>Number format</string>
+			<key>type</key>
+			<string>textfield</string>
+			<key>variable</key>
+			<string>number_locale</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<true/>
+				<key>required</key>
+				<false/>
+				<key>text</key>
+				<string>Show intraday sparklines (Yahoo Finance)</string>
+			</dict>
+			<key>description</key>
+			<string></string>
+			<key>label</key>
+			<string>Icons</string>
+			<key>type</key>
+			<string>checkbox</string>
+			<key>variable</key>
+			<string>sparklines</string>
+		</dict>
 	</array>
+	<key>variables</key>
+	<dict/>
+	<key>variablesdontexport</key>
+	<array/>
 	<key>version</key>
-	<string>0.1.0</string>
+	<string>1.0.0</string>
 	<key>webaddress</key>
 	<string>https://github.com/x-o-r-r-o/alfred-stocks</string>
 </dict>

@@ -1,0 +1,13 @@
+{
+  "icon": ["chart.line.uptrend.xyaxis", "#0F766E"],
+  "up": ["arrowtriangle.up.fill", "#16A34A"],
+  "down": ["arrowtriangle.down.fill", "#DC2626"],
+  "flat": ["chart.line.flattrend.xyaxis", "#64748B"],
+  "error": ["exclamationmark.triangle.fill", "#DC2626"],
+  "info": ["info.circle.fill", "#64748B"],
+  "key": ["key.horizontal.fill", "#D97706"],
+  "search": ["magnifyingglass", "#2563EB"],
+  "watch": ["star.fill", "#CA8A04"],
+  "refresh": ["arrow.clockwise", "#0891B2"],
+  "settings": ["gearshape.fill", "#475569"]
+}
