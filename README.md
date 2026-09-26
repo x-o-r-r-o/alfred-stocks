@@ -8,7 +8,7 @@ See your watchlist via the `stock` keyword. Each row shows the price, the change
 
 ![The watchlist with sparklines](images/watchlist.png)
 
-Look up a quote by typing a ticker or company name after the keyword, like `stock apple`, `stock BTC-USD` or `stock EURUSD=X`.
+Look up a stock, index, cryptocurrency or currency pair by ticker or company name, like `apple`, `^GSPC`, `BTC-USD` or `EURUSD=X`, via the `stock` keyword.
 
 ![Searching for a company](images/search.png)
 
@@ -21,7 +21,7 @@ Alternatively, look up selected text via the Universal Action.
 * <kbd>⌘</kbd><kbd>Y</kbd> Quick Look the quote page.
 * <kbd>⌘</kbd><kbd>L</kbd> Show the quote in Large Type.
 
-Type `:` after the keyword for more: `:reset` restores the default watchlist, `:cache` clears cached quotes and `:config` opens the Workflow’s Configuration.
+Reset the watchlist (`:reset`), clear cached quotes (`:cache`) or open the Workflow’s Configuration (`:config`) by typing `:` via the `stock` keyword.
 
 ![Settings](images/settings.png)
 

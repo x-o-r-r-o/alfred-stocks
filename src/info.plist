@@ -229,7 +229,7 @@
 
 See your watchlist via the `stock` keyword. Each row shows the price, the change since the previous close (▲ up, ▼ down), the day range and whether the market is open, with the day’s chart as its icon. Quotes appear instantly from the cache and refresh in the background.
 
-Look up a quote by typing a ticker or company name after the keyword, like `stock apple`, `stock BTC-USD` or `stock EURUSD=X`.
+Look up a stock, index, cryptocurrency or currency pair by ticker or company name, like `apple`, `^GSPC`, `BTC-USD` or `EURUSD=X`, via the `stock` keyword.
 
 Alternatively, look up selected text via the Universal Action.
 
@@ -240,7 +240,7 @@ Alternatively, look up selected text via the Universal Action.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;Y&lt;/kbd&gt; Quick Look the quote page.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;L&lt;/kbd&gt; Show the quote in Large Type.
 
-Type `:` after the keyword for more: `:reset` restores the default watchlist, `:cache` clears cached quotes and `:config` opens the Workflow’s Configuration.
+Reset the watchlist (`:reset`), clear cached quotes (`:cache`) or open the Workflow’s Configuration (`:config`) by typing `:` via the `stock` keyword.
 
 ### Data providers
 

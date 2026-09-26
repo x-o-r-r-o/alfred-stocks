@@ -643,7 +643,9 @@ function hexColor(hex, a = 1) {
 // Draw an intraday sparkline on a coloured tile (matches the other icons). ~5 ms per icon.
 function drawSparkline(series, prev, up, path) {
   const S = 128, pad = 22;
-  const pts = series.length > 120 ? series.filter((_, i) => i % Math.ceil(series.length / 120) === 0) : series.slice();
+  // downsample to ≤ 120 points, always keeping the last one (the current price)
+  const step = Math.ceil(series.length / 120);
+  const pts = step > 1 ? series.filter((_, i) => i % step === 0 || i === series.length - 1) : series.slice();
   if (pts.length < 2) return false;
   const rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(null, S, S, 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0);
   if (rep.isNil()) return false;

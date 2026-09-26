@@ -789,6 +789,22 @@ class Audit2RegressionTests(Base):
         self.assertEqual(self.env.watchlist(), ["AAPL"])
 
 
+class Audit3RegressionTests(Base):
+    """Bugs found in the third audit pass."""
+
+    def test_sparkline_keeps_the_last_point(self):
+        def chart(closes):
+            body = json.loads(fixture("yahoo/chart_AAPL")[1])
+            body["chart"]["result"][0]["indicators"]["quote"][0]["close"] = closes
+            return (200, json.dumps(body).encode())
+        Mock.overrides["yahoo/chart_FLAT"] = chart([340.0] * 200)
+        Mock.overrides["yahoo/chart_SPIKE"] = chart([340.0] * 199 + [345.0])  # index 199 was dropped by the 1-in-2 sampling
+        self.env.watchlist('{"symbols":["FLAT","SPIKE"]}')
+        it = self.env.items()
+        with open(it[0]["icon"]["path"], "rb") as a, open(it[1]["icon"]["path"], "rb") as b:
+            self.assertNotEqual(a.read(), b.read())
+
+
 class PlistTests(unittest.TestCase):
     def test_build_and_plist(self):
         subprocess.run([sys.executable, "tools/build.py"], cwd=ROOT, check=True, capture_output=True)
