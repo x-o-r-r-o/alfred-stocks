@@ -348,6 +348,7 @@ const PROVIDERS = {
     needsKey: true,
     keyURL: "https://finnhub.io/register",
     searchQuotes: 6, // free plan: 60 calls/minute
+    limits: [[60, 55]],
     batch: 30,
     base: () => env("STOCKS_FINNHUB_URL", "https://finnhub.io/api/v1"),
     searchReq(q, key) {
@@ -384,6 +385,7 @@ const PROVIDERS = {
     searchQuotes: 1, // free plan: 25 calls/day, so quotes are kept for hours and fetched one at a time
     minTTL: 3 * 3600,
     closedTTL: 12 * 3600,
+    limits: [["day", 25]],
     batch: 5,
     gap: 60,
     parallel: 1,
@@ -435,6 +437,7 @@ const PROVIDERS = {
     keyURL: "https://twelvedata.com/pricing",
     searchQuotes: 4, // free plan: 8 credits a minute, 800 a day
     minTTL: 5 * 60,
+    limits: [[60, 8], ["day", 800]],
     batch: 8,
     gap: 60,
     base: () => env("STOCKS_TWELVEDATA_URL", "https://api.twelvedata.com"),
@@ -486,7 +489,8 @@ function fxHint(sym) {
 }
 
 function provider() {
-  return PROVIDERS[env("provider", "yahoo")] || PROVIDERS.yahoo;
+  const id = env("provider", "yahoo");
+  return Object.prototype.hasOwnProperty.call(PROVIDERS, id) ? PROVIDERS[id] : PROVIDERS.yahoo;
 }
 
 // ---------- keychain ----------
@@ -708,7 +712,7 @@ const sparkDir = () => mkdirs(`${cacheDir()}/spark`);
 // {SYMBOL: entry}; entries from another provider are ignored
 function loadQuotes() {
   const all = readJSON(quotesPath(), {});
-  const p = provider().id, out = {};
+  const p = provider().id, out = Object.create(null);
   for (const [k, v] of Object.entries(all)) if (v && typeof v === "object" && v.provider === p && typeof v.fetched === "number") out[k] = v;
   return out;
 }
@@ -723,7 +727,7 @@ function saveQuotes(entries) {
 
 function ttl(e, t) {
   if (e.missing) return MISSING_TTL;
-  const p = PROVIDERS[e.provider] || provider();
+  const p = Object.prototype.hasOwnProperty.call(PROVIDERS, e.provider) ? PROVIDERS[e.provider] : provider();
   // the long TTL only when the market was already closed at fetch time: a quote fetched just before
   // the close (or before FX's daily 1-minute break) is fetched again to pick up the new session
   const closed = stateOf(e, t) === "CLOSED" && stateOf(e, e.fetched) === "CLOSED";
@@ -740,7 +744,7 @@ function fresh(e, t) {
 function setStatus(err) {
   const t = now();
   writeFile(statusPath(), JSON.stringify(err
-    ? { provider: provider().id, at: t, until: Math.max(err.until || 0, t + RETRY_AFTER), kind: err.kind, message: oneLine(redact(err.message), 100), status: err.status }
+    ? { provider: provider().id, at: t, until: err.local ? err.until : Math.max(err.until || 0, t + RETRY_AFTER), kind: err.kind, message: oneLine(redact(err.message), 100), status: err.status }
     : { provider: provider().id, at: t, ok: true }));
 }
 function lastError() {
@@ -761,6 +765,59 @@ function refreshRunning() {
   const age = Math.max(a1, a2);
   // a refresh that Alfred killed (or that crashed) must not block the next one; a slow live one must not start a second
   return typeof l.pid === "number" ? alive(l.pid) && age < REFRESH_MAX : age < LOCK_TTL;
+}
+
+// Serialise a read-modify-write across processes: mkdir is atomic. A lock left by a killed process
+// is taken over after a few seconds.
+function withLock(dir, fn) {
+  const until = Date.now() + 3000;
+  let got = false;
+  while (!(got = FM.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, false, $(), $()))) {
+    const age = Date.now() / 1000 - mtime(dir);
+    if (exists(dir) && (age > 10 || age < -60)) removeFile(dir);
+    else if (Date.now() > until) break;
+    else $.NSThread.sleepForTimeInterval(0.05);
+  }
+  try {
+    return fn();
+  } finally {
+    if (got) removeFile(dir);
+  }
+}
+
+// Keyed free plans publish per-minute/per-day limits. Every process (Script Filter runs, background
+// refreshes) takes its requests from one shared log, so a search right after a watchlist refresh
+// doesn't trip the provider's limit. Returns {granted, error}: error when nothing may go out now.
+// Yahoo publishes no limit and relies on the back-off after a 429.
+const requestsPath = () => `${cacheDir()}/requests.json`;
+function takeBudget(p, n) {
+  if (!p.limits || n <= 0) return { granted: n, error: null };
+  return withLock(`${cacheDir()}/requests.lock`, () => {
+    const t = now();
+    const all = readJSON(requestsPath(), {});
+    for (const k of Object.keys(all)) if (!Object.prototype.hasOwnProperty.call(PROVIDERS, k) || !Array.isArray(all[k])) delete all[k];
+    const log = (all[p.id] || []).filter((x) => typeof x === "number" && x <= t + 60 && t - x < 86400);
+    let granted = n, wait = 0, daily = false;
+    for (const [win, max] of p.limits) {
+      const from = win === "day" ? Math.floor(t / 86400) * 86400 : t - win; // daily quotas reset at 00:00 UTC
+      const used = log.filter((x) => x > from).sort((a, b) => a - b);
+      const left = Math.max(0, max - used.length);
+      if (!left) {
+        const free = win === "day" ? from + 86400 : used[used.length - max] + win;
+        if (free - t > wait) [wait, daily] = [free - t, win === "day"];
+      }
+      granted = Math.min(granted, left);
+    }
+    for (let i = 0; i < granted; i++) log.push(t);
+    all[p.id] = log;
+    writeFile(requestsPath(), JSON.stringify(all));
+    if (granted) return { granted, error: null };
+    const perMin = (p.limits.find(([w]) => w === 60) || [])[1], perDay = (p.limits.find(([w]) => w === "day") || [])[1];
+    const e = new ProviderError("rate", daily ? `daily limit reached (${perDay} requests a day on the free plan)` : `request limit reached (${perMin} a minute on the free plan)`);
+    e.until = t + Math.max(1, Math.ceil(wait));
+    e.local = true;
+    return { granted: 0, error: e };
+  });
 }
 
 // ---------- sparklines ----------
@@ -821,6 +878,9 @@ function fetchQuotes(symbols, names = {}) {
   const p = provider();
   const key = p.needsKey ? KEY || (KEY = getKey(p)) : "";
   if (p.needsKey && !key) return { entries: {}, error: new ProviderError("nokey", "no API key"), allFailed: true };
+  const budget = takeBudget(p, symbols.length);
+  if (!budget.granted) return { entries: {}, error: budget.error, allFailed: true };
+  symbols = symbols.slice(0, budget.granted); // the rest wait for the next refresh (or ⇥ in a search)
   const resps = httpMany(symbols.map((s) => p.quoteReq(s, key)), p.parallel || 8);
   const t = now(), old = loadQuotes(), entries = {};
   let error = null, failed = 0;
@@ -886,9 +946,11 @@ function search(q) {
   const err = lastError();
   if (err && err.kind === "rate" && backingOff(err)) throw Object.assign(new ProviderError("rate", err.message, err.status), { until: err.until, recorded: true });
   const key = p.needsKey ? KEY || (KEY = getKey(p)) : "";
+  const budget = takeBudget(p, 1);
+  if (!budget.granted) throw budget.error;
   let results = p.parseSearch(parseBody(p, httpMany([p.searchReq(q, key)])[0]));
   const plain = q.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  if (!results.length && plain !== q) results = p.parseSearch(parseBody(p, httpMany([p.searchReq(plain, key)])[0]));
+  if (!results.length && plain !== q && takeBudget(p, 1).granted) results = p.parseSearch(parseBody(p, httpMany([p.searchReq(plain, key)])[0]));
   const seen = new Set();
   results = results.filter((r) => SYMBOL_RE.test(r.symbol) && !seen.has(r.symbol) && seen.add(r.symbol)).slice(0, 10);
   cache[k] = { at: now(), results };
@@ -934,29 +996,25 @@ function loadWatchlist() {
   return { symbols: salvaged, damaged: true };
 }
 
-// Serialise read-modify-write edits (two quick ⌥↩ in a row, or an edit while another runs): mkdir is
-// atomic. A lock left by a killed process is taken over after a few seconds.
+// Serialise read-modify-write edits (two quick ⌥↩ in a row, or an edit while another runs).
 function withWatchlistLock(fn) {
-  const dir = `${dataDir()}/watchlist.lock`;
-  const until = Date.now() + 3000;
-  let got = false;
-  while (!(got = FM.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, false, $(), $()))) {
-    const age = Date.now() / 1000 - mtime(dir);
-    if (exists(dir) && (age > 10 || age < -60)) removeFile(dir);
-    else if (Date.now() > until) break;
-    else $.NSThread.sleepForTimeInterval(0.05);
-  }
-  try {
-    return fn();
-  } finally {
-    if (got) removeFile(dir);
+  return withLock(`${dataDir()}/watchlist.lock`, fn);
+}
+
+// keep the newest 5 backups of each kind
+function pruneBackups() {
+  for (const kind of ["damaged", "backup"]) {
+    const files = listDir(dataDir()).filter((f) => f.startsWith(`watchlist.json.${kind}-`)).sort((a, b) => Number(b.split("-").pop()) - Number(a.split("-").pop()));
+    for (const f of files.slice(5)) removeFile(`${dataDir()}/${f}`);
   }
 }
 
 function saveWatchlist(symbols) {
   const path = watchlistPath();
-  if (exists(path) && loadWatchlist().damaged) // keep a backup of an unreadable file
+  if (exists(path) && loadWatchlist().damaged) { // keep a backup of an unreadable file
     FM.copyItemAtPathToPathError(path, `${path}.damaged-${Math.round(Date.now() / 1000)}`, $());
+    pruneBackups();
+  }
   return writeFile(path, JSON.stringify({ version: 1, symbols: cleanSymbols(symbols) }, null, 2) + "\n");
 }
 
@@ -1029,8 +1087,13 @@ function quoteItem(q, t, inWatchlist, watchMode) {
       },
     },
   };
-  if (watchMode) item.mods.ctrl = { arg: q.symbol, valid: true, subtitle: `Move ${q.symbol} to the top of the watchlist`, variables: { stocks_action: "top", stocks_reopen: "1" } };
+  item.mods.ctrl = topMod(q.symbol, inWatchlist, watchMode);
   return item;
+}
+
+// ⌃↩: move to the top of the watchlist (or add it there from a search)
+function topMod(sym, inWatchlist, watchMode) {
+  return { arg: sym, valid: true, subtitle: inWatchlist ? `Move ${sym} to the top of the watchlist` : `Add ${sym} to the top of the watchlist`, variables: { stocks_action: "top", stocks_reopen: watchMode ? "1" : "0" } };
 }
 
 // a symbol without a quote (not loaded yet, not quoted by a keyed plan, or unknown)
@@ -1041,6 +1104,7 @@ function plainItem(sym, meta, inWatchlist, watchMode, subtitle) {
     subtitle: subtitle || [meta && meta.exchange, meta && meta.type].filter(Boolean).join(" · ") || `Open in ${siteName()}`,
     arg: url,
     autocomplete: sym,
+    quicklookurl: /^https:/.test(url) ? url : `https://finance.yahoo.com/quote/${encodeURIComponent(sym)}/`,
     variables: { stocks_action: "open" },
     icon: icon("flat"),
     mods: {
@@ -1053,7 +1117,7 @@ function plainItem(sym, meta, inWatchlist, watchMode, subtitle) {
       },
     },
   };
-  if (watchMode) item.mods.ctrl = { arg: sym, valid: true, subtitle: `Move ${sym} to the top of the watchlist`, variables: { stocks_action: "top", stocks_reopen: "1" } };
+  item.mods.ctrl = topMod(sym, inWatchlist, watchMode);
   return item;
 }
 
@@ -1130,7 +1194,7 @@ function searchItems(query) {
     error = e;
     results = [];
   }
-  const meta = {};
+  const meta = Object.create(null);
   for (const r of results) meta[r.symbol] = r;
   const symbols = results.map((r) => r.symbol);
   // An exact ticker goes first. One the search doesn't know is still tried: first when typed in
@@ -1271,9 +1335,10 @@ function act(arg) {
         const list = loadWatchlist().symbols;
         let next;
         if (action === "top") {
+          if (!list.includes(sym) && list.length >= MAX_WATCHLIST) return [false, `The watchlist is full (${MAX_WATCHLIST} symbols)`];
           next = [sym, ...list.filter((s) => s !== sym)];
           if (!saveWatchlist(next)) return [false, "Could not save the watchlist"];
-          return [true, `Moved ${sym} to the top of the watchlist`];
+          return [true, list.includes(sym) ? `Moved ${sym} to the top of the watchlist` : `Added ${sym} to the top of the watchlist`];
         }
         if (list.includes(sym)) {
           next = list.filter((s) => s !== sym);
@@ -1290,6 +1355,7 @@ function act(arg) {
     case "reset": {
       return withWatchlistLock(() => {
         if (exists(watchlistPath())) FM.copyItemAtPathToPathError(watchlistPath(), `${watchlistPath()}.backup-${Math.round(Date.now() / 1000)}`, $());
+        pruneBackups();
         return saveWatchlist(defaultWatchlist());
       }) ? "Watchlist reset" : "Could not save the watchlist";
     }
@@ -1313,17 +1379,23 @@ function act(arg) {
   return "";
 }
 
-// Alfred rejects the whole JSON when a string holds an unpaired surrogate (from "&#xD800;" or a bad API)
+// Alfred rejects the whole JSON when a string holds an unpaired surrogate (from "&#xD800;" or a bad API).
+// Bidi overrides and control characters (from an API's names or the query) are removed from display
+// text; newlines stay (Large Type). Args are URLs, validated symbols or fixed words, so nothing real is lost.
 function wellFormed(k, v) {
-  return typeof v === "string" ? v.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, (m) => (m.length === 2 ? m : "\uFFFD")) : v;
+  if (typeof v !== "string") return v;
+  return v
+    .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, (m) => (m.length === 2 ? m : "\uFFFD"))
+    .replace(/[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]+/g, " ");
 }
 
 function run(argv) {
   const [cmd, ...rest] = argv;
   try {
     switch (cmd) {
-      case "filter":
-        return JSON.stringify(Object.assign({ skipknowledge: true }, filter(rest.join(" "))), wellFormed);
+      case "filter": // the query comes in stocks_query (see workflow.json) or, for tests, as arguments
+        return JSON.stringify(Object.assign({ skipknowledge: true }, filter(rest.length ? rest.join(" ") : env("stocks_query", ""))), wellFormed);
       case "refresh":
         return refresh(rest);
       case "act":

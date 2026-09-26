@@ -39,7 +39,7 @@
       "type": "popupbutton",
       "variable": "open_in",
       "label": "Open quotes in (↩)",
-      "description": "",
+      "description": "Where ↩ opens a quote. ⌘Y previews it on the web.",
       "config": {
         "default": "yahoo",
         "pairs": [
@@ -66,7 +66,7 @@
       "type": "checkbox",
       "variable": "sparklines",
       "label": "Icons",
-      "description": "",
+      "description": "Draws the day’s chart as each quote’s icon. Off: ▲ ▼ arrows.",
       "config": {
         "default": true,
         "required": false,
@@ -81,7 +81,7 @@
       "keyword": "{var:keyword_stock}",
       "title": "Stocks",
       "subtext": "Your watchlist, or type a ticker or company",
-      "script": "osascript -l JavaScript ./stocks.js filter \"$1\"",
+      "script": "stocks_query=\"$1\" exec osascript -l JavaScript ./stocks.js filter",
       "queuedelaymode": 1,
       "running": "Fetching quotes…"
     },

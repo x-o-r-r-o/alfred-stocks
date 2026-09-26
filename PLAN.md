@@ -19,12 +19,29 @@ Raycast demand this workflow replaces (downloads, 2026-09-26):
 - [x] Open in Stocks.app / Yahoo / TradingView
 - [x] Company/ticker search (Yahoo search endpoint or the keyed provider's search), crypto (`BTC-USD`) and FX (`EURUSD=X`)
 - [x] Market state (pre / open / after hours / closed), currency, exchange; ▲▼ with green/red icons
-- [x] ↩ open in Yahoo Finance / Google Finance / TradingView / Stocks.app, ⌘↩ copy price, ⌥↩ add/remove, ⌃↩ move to top
+- [x] ↩ open in Yahoo Finance / Google Finance / TradingView / Stocks.app, ⌘↩ copy price, ⌥↩ add/remove, ⌃↩ move to (or add at) the top
 - [x] Providers: Yahoo Finance (no key, unofficial) by default; Finnhub, Twelve Data, Alpha Vantage with the key in the Keychain (`:key`)
 - [x] Cache: quotes 60 s while a session is open, 15 min when closed; background refresh with `rerun`; searches 24 h
 - [x] Clear provider errors (401/403/429/5xx/malformed/empty/timeout/offline) pointing to the Workflow’s Configuration
 - [x] Damaged watchlist file detected, symbols salvaged, backup kept
+- [x] Keyed free plans: one request log shared by every process (Finnhub 55/min, Twelve Data 8/min and 800/day, Alpha Vantage 25/day), so searches and background refreshes never exceed the published limits; plus a back-off after a 429
 - [x] Tests against fixtures captured from the real endpoints, a mock server, and an optional live smoke test
+
+## Known limitations
+- Yahoo Finance's endpoints are unofficial: they can change or start requiring a cookie/crumb at any time (the error row points to the other providers).
+- Keyed free plans mostly cover US markets; other symbols show "Not available on your plan".
+- Alpha Vantage's 25 requests a day go quickly: every new search costs a search and a quote.
+- The request log counts only this workflow's requests; a key also used elsewhere can still hit the provider's limit (then the 429 back-off applies).
+- Alfred passes the typed query to the Script Filter's bash as an argument, so a key typed after `:key` is visible in `ps` for a few milliseconds (bash then `exec`s osascript with the query in the environment). Saving the key from the clipboard avoids it.
+- NYSE holidays are listed for 2026–2027 (only used by Finnhub and Alpha Vantage quotes; later years fall back to weekdays).
+
+## Verify in real Alfred before release
+- `:config` reveals the workflow in Alfred Preferences (AppleScript `reveal workflow`); check it lands on the workflow and the Configure button is obvious.
+- ⌥↩ / ⌃↩ in the watchlist reopen Alfred on the watchlist (AppleScript `search`); the first run may ask for Automation permission.
+- The background refresh survives typing (setsid) and `rerun` refreshes the rows without flicker.
+- Sparkline icons refresh (a new file per refresh) and ⌘Y / ⌘L work on quote rows.
+- `stocks://` opens the Stocks app on the right symbol.
+- The Universal Action on selected text (e.g. "AAPL" in a web page).
 
 ## Tech
 - **Stack:** JXA (`osascript -l JavaScript`) + `/usr/bin/curl` (parallel requests, config on stdin so keys never appear in `ps`) + AppKit drawing for sparklines + the Security framework for the Keychain (no `security -w KEY` on a command line).

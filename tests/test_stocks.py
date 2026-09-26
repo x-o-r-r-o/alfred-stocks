@@ -399,7 +399,8 @@ class WatchlistTests(Base):
     def test_search_row_knows_watchlist(self):
         it = self.env.items("AAPL")
         self.assertIn("Remove AAPL", it[0]["mods"]["alt"]["subtitle"])
-        self.assertNotIn("ctrl", it[0]["mods"])
+        self.assertEqual(it[0]["mods"]["ctrl"]["subtitle"], "Move AAPL to the top of the watchlist")
+        self.assertEqual(it[0]["mods"]["ctrl"]["variables"], {"stocks_action": "top", "stocks_reopen": "0"})
 
 
 class CorruptionTests(Base):
@@ -1042,6 +1043,69 @@ class Audit4RegressionTests(Base):
             p.communicate(timeout=30)
         self.assertEqual(sorted(self.env.watchlist()), syms)
         self.assertFalse(os.path.exists(os.path.join(self.env.data, "watchlist.lock")))
+
+
+class FinalReviewRegressionTests(Base):
+    def test_bidi_and_control_characters_removed_from_display(self):
+        body = json.loads(fixture("yahoo/chart_AAPL")[1])
+        body["chart"]["result"][0]["meta"]["longName"] = "Evil\u202eCorp\u0007 Inc\u2066."
+        Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps(body).encode())
+        it = self.env.items("AAPL")
+        self.assertTrue(it[0]["subtitle"].startswith("EvilCorp  Inc."), it[0]["subtitle"])
+        it = self.env.items("zz\u202ezz\u0001")
+        raw = json.dumps(it, ensure_ascii=False)
+        self.assertNotIn("\u202e", raw)
+        self.assertNotIn("\u0001", raw)
+
+    def test_query_from_environment(self):
+        out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "filter"], cwd=SRC,
+                             env=self.env.vars(stocks_query=":cache"), capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(out.stdout)["items"][0]["title"], ":cache  Clear cached quotes")
+        with open(os.path.join(SRC, "info.plist"), "rb") as f:
+            script = next(o for o in plistlib.load(f)["objects"] if o["type"] == "alfred.workflow.input.scriptfilter")["config"]["script"]
+        self.assertNotIn("filter \"$1\"", script)  # the query (maybe an API key) never goes on osascript's argv
+
+    def test_shared_budget_across_refresh_and_search(self):
+        self.env.set_key("twelvedata")
+        self.env.watchlist(json.dumps({"symbols": [f"S{i}" for i in range(8)]}))
+        self.env.items(provider="twelvedata")  # the refresh spends the minute's 8 credits
+        n = len(Mock.requests)
+        it = self.env.items("MSFT", provider="twelvedata", STOCKS_TEST_NOW=NOW + 20)
+        self.assertEqual(len(Mock.requests), n)  # nothing sent: the provider would answer 429
+        self.assertEqual(it[0]["title"], "Twelve Data: request limit reached (8 a minute on the free plan)")
+        Mock.overrides["twelvedata/quote_MSFT"] = fixture("twelvedata/quote_AAPL")
+        it = self.env.items("MSFT", provider="twelvedata", STOCKS_TEST_NOW=NOW + 61)  # the minute is over
+        self.assertTrue(it[0]["title"].startswith("MSFT"), it[0]["title"])
+
+    def test_budget_caps_quotes_per_search(self):
+        self.env.set_key("twelvedata")
+        os.makedirs(self.env.cache)
+        with open(os.path.join(self.env.cache, "requests.json"), "w") as f:
+            f.write(json.dumps({"twelvedata": [NOW - 10] * 6, "bogus": 3, "__proto__": []}))
+        self.env.items("aapl", provider="twelvedata")  # 1 search + 1 quote left of 8 (4 wanted)
+        self.assertEqual(len([p for p, _ in Mock.requests if p.startswith("/quote")]), 1)
+        log = json.loads(read(os.path.join(self.env.cache, "requests.json")))
+        self.assertEqual(list(log), ["twelvedata"])
+
+    def test_ctrl_adds_at_top_and_respects_cap(self):
+        self.assertEqual(self.env.act("top", "TSLA"), "Added TSLA to the top of the watchlist")
+        self.assertEqual(self.env.watchlist()[0], "TSLA")
+        self.env.watchlist(json.dumps({"symbols": [f"S{i}" for i in range(50)]}))
+        self.assertIn("full", self.env.act("top", "AAPL"))
+        self.assertEqual(self.env.act("top", "S9"), "Moved S9 to the top of the watchlist")
+
+    def test_reset_backups_are_pruned(self):
+        os.makedirs(self.env.data, exist_ok=True)
+        for i in range(8):
+            open(os.path.join(self.env.data, f"watchlist.json.backup-{1000 + i}"), "w").close()
+        self.env.watchlist(json.dumps({"symbols": ["AAPL"]}))
+        self.env.act("reset", "reset")
+        backups = [f for f in os.listdir(self.env.data) if ".backup-" in f]
+        self.assertEqual(len(backups), 5)
+        self.assertNotIn("watchlist.json.backup-1000", backups)
+
+    def test_unknown_provider_value(self):
+        self.assertTrue(self.env.items(provider="constructor")[0]["title"].startswith("^GSPC"))
 
 
 @unittest.skipUnless(os.environ.get("STOCKS_KEYCHAIN") == "1", "set STOCKS_KEYCHAIN=1 to test the real Keychain (a throwaway item)")
