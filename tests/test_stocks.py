@@ -9,7 +9,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
 FIX = os.path.join(ROOT, "tests", "fixtures")
-FAKE_SECURITY = os.path.join(ROOT, "tests", "fake_security.sh")
 
 # Saturday 2026-09-26 ~09:40 New York: every equity market in the fixtures is closed
 NOW = 1790430000
@@ -115,7 +114,7 @@ class Env:
                  alfred_workflow_bundleid="io.github.x-o-r-r-o.stocks",
                  STOCKS_YAHOO_URL=BASE, STOCKS_FINNHUB_URL=BASE + "/api/v1", STOCKS_ALPHAVANTAGE_URL=BASE,
                  STOCKS_TWELVEDATA_URL=BASE, STOCKS_TEST_NOW=str(NOW), STOCKS_SYNC="1", STOCKS_TIMEOUT="5",
-                 STOCKS_SECURITY=FAKE_SECURITY, FAKE_KEYCHAIN=self.keychain, STOCKS_TEST_NOOPEN="1",
+                 STOCKS_TEST_KEYCHAIN=self.keychain, STOCKS_TEST_CLIPBOARD="", STOCKS_TEST_NOOPEN="1",
                  number_locale="en-US")
         e.update({k: str(v) for k, v in extra.items()})
         return e
@@ -455,8 +454,9 @@ class FailureTests(Base):
         e = self.check((403, b"Forbidden"), "Yahoo Finance: access denied (HTTP 403)")
         self.assertEqual(e["variables"]["stocks_action"], "config")
         self.assertIn("Workflow’s Configuration", e["subtitle"])
-        self.check((429, b"Too Many Requests"), "Yahoo Finance: rate limited (HTTP 429)")
         self.check((500, b"oops"), "Yahoo Finance: server error (HTTP 500)")
+        self.check((429, b"Too Many Requests"), "Yahoo Finance: rate limited (HTTP 429)")
+        self.env = Env()  # a rate limit backs off for a minute
         self.check((502, b"<html>bad gateway</html>"), "Yahoo Finance: server error (HTTP 502)")
 
     def test_malformed_and_empty(self):
@@ -513,11 +513,13 @@ class KeyedProviderTests(Base):
         it = self.env.items(":key short", provider="finnhub")
         self.assertEqual(it[0]["title"], "That doesn’t look like an API key")
         it = self.env.items(f":key {KEY}", provider="finnhub")
-        self.assertEqual(it[0]["title"], "Save Finnhub API key test…7890")
+        self.assertEqual(it[0]["title"], "Save Finnhub API key …7890")
         self.assertEqual(it[0]["variables"]["stocks_action"], "savekey")
-        self.assertEqual(self.env.act("savekey", it[0]["arg"], provider="finnhub"), "Saved the Finnhub API key")
+        self.assertNotIn(KEY, it[0]["arg"])  # the argument ends up on the action's command line
+        self.assertEqual(self.env.act("savekey", it[0]["arg"], provider="finnhub", stocks_key=it[0]["variables"]["stocks_key"]), "Saved the Finnhub API key")
         self.assertEqual(read(os.path.join(self.env.keychain, "io.github.x-o-r-r-o.stocks.finnhub")), KEY)
-        self.assertEqual(self.env.act("savekey", "bad key", provider="finnhub"), "Not saved: invalid API key")
+        self.assertEqual(self.env.act("savekey", "savekey", provider="finnhub", stocks_key="bad key"), "Not saved: invalid API key")
+        self.assertEqual(self.env.act("savekey", KEY, provider="finnhub"), "Not saved: invalid API key")  # never from argv
         self.assertTrue(self.env.items("AAPL", provider="finnhub")[0]["title"].startswith("AAPL   341.07 USD"))
         it = self.env.items(":key", provider="finnhub")
         self.assertEqual(find(it, "Remove")["variables"]["stocks_action"], "delkey")
@@ -571,10 +573,16 @@ class KeyedProviderTests(Base):
         self.assertEqual(len([p for p, _ in Mock.requests if "GLOBAL_QUOTE" in p]), 2)  # 1 quote per search (25/day)
         Mock.overrides["alphavantage/quote_MSFT"] = fixture("alphavantage/ratelimit_information")
         it = self.env.items("MSFT", provider="alphavantage")
-        self.assertEqual(it[0]["title"], "Alpha Vantage: rate limit reached (25 requests a day on the free plan)")
+        self.assertEqual(it[0]["title"], "Alpha Vantage: daily limit reached (25 requests a day on the free plan)")
         self.assertNotIn(KEY, json.dumps(it))
+        # the daily limit holds until 00:00 UTC: no more requests until then
+        n = len(Mock.requests)
+        self.assertTrue(self.env.items("NOPE", provider="alphavantage")[0]["title"].startswith("Alpha Vantage: daily limit"))
+        self.assertTrue(self.env.items("", provider="alphavantage", STOCKS_TEST_NOW=NOW + 3600)[0]["title"].startswith("Alpha Vantage: daily limit"))
+        self.assertEqual(len(Mock.requests), n)
         Mock.overrides["alphavantage/quote_NOPE"] = fixture("alphavantage/invalid_call")
-        self.assertEqual(self.env.items("NOPE", provider="alphavantage")[0]["title"], "No data for NOPE")
+        midnight = (NOW // 86400 + 1) * 86400
+        self.assertEqual(self.env.items("NOPE", provider="alphavantage", STOCKS_TEST_NOW=midnight + 5)[0]["title"], "No data for NOPE")
 
     def test_key_never_written_to_disk(self):
         self.env.set_key("alphavantage")
@@ -648,7 +656,7 @@ class Audit1RegressionTests(Base):
         self.env.set_key("twelvedata")
         monday_open = NOW + 2 * 86400
         it = self.env.items("AAPL", provider="twelvedata", STOCKS_TEST_NOW=monday_open)
-        self.assertTrue(it[0]["subtitle"].endswith("Closed"), it[0]["subtitle"])  # is_market_open=false during hours
+        self.assertIn("· Closed · as of ", it[0]["subtitle"])  # is_market_open=false during hours; Friday's price
 
     def test_quote_from_the_future_is_refetched(self):
         self.env.items("AAPL", STOCKS_TEST_NOW=NOW + 86400)
@@ -803,6 +811,236 @@ class Audit3RegressionTests(Base):
         it = self.env.items()
         with open(it[0]["icon"]["path"], "rb") as a, open(it[1]["icon"]["path"], "rb") as b:
             self.assertNotEqual(a.read(), b.read())
+
+
+class Audit4RegressionTests(Base):
+    """Bugs found in the fourth audit pass."""
+
+    def raw(self, query, **extra):
+        return subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "filter", query], cwd=SRC,
+                              env=self.env.vars(**extra), capture_output=True, timeout=60).stdout
+
+    # --- the API key never reaches a command line
+    def test_api_key_stays_off_command_lines(self):
+        js = read(os.path.join(SRC, "stocks.js"))
+        self.assertNotIn("/usr/bin/security", js)  # `security … -w KEY` showed the key in `ps`
+        it = self.env.items(f":key {KEY}", provider="finnhub")[0]
+        self.assertNotIn(KEY, it["arg"])
+        self.assertNotIn(KEY, json.dumps(it["text"]))
+        self.assertNotIn(KEY, it["title"])
+        self.assertEqual(it["variables"]["stocks_key"], KEY)
+        self.assertEqual(self.env.act("savekey", it["arg"], provider="finnhub", stocks_key=KEY), "Saved the Finnhub API key")
+
+    def test_key_from_the_clipboard(self):
+        it = self.env.items(":key", provider="twelvedata", STOCKS_TEST_CLIPBOARD=KEY)
+        self.assertEqual(it[0]["title"], "Save the Twelve Data API key from the clipboard …7890")
+        self.assertEqual(it[0]["variables"], {"stocks_action": "savekey", "stocks_key": KEY})
+        it = self.env.items(":key", provider="twelvedata", STOCKS_TEST_CLIPBOARD="not a key at all")
+        self.assertFalse(it[0]["title"].startswith("Save"))
+
+    # --- refresh lock
+    def lock(self, **fields):
+        os.makedirs(self.env.cache, exist_ok=True)
+        with open(os.path.join(self.env.cache, "refresh.lock"), "w") as f:
+            json.dump(fields, f)
+
+    def test_lock_of_a_dead_refresh_is_ignored(self):
+        p = subprocess.Popen(["true"])
+        p.wait()
+        self.lock(started=NOW, pid=p.pid)  # Alfred killed the refresh: don't wait 30 s
+        self.assertTrue(self.env.items()[0]["title"].startswith("^GSPC   7,743.41"))
+
+    def test_lock_of_a_live_refresh_is_respected_beyond_30s(self):
+        self.lock(started=NOW - 45, pid=os.getpid())  # 50 slow symbols take longer than 30 s
+        data = self.env.sf()
+        self.assertEqual(data["rerun"], 0.5)
+        self.assertEqual(Mock.requests, [])
+
+    def test_lock_from_the_future_is_ignored(self):
+        self.lock(started=NOW + 86400)
+        self.assertTrue(self.env.items()[0]["title"].startswith("^GSPC   7,743.41"))
+
+    # --- keyed providers: per-symbol plan limits and budgets
+    def test_symbol_outside_the_plan_is_not_a_key_error(self):
+        self.env.set_key("finnhub")
+        self.env.watchlist('{"symbols":["AAPL","AAPL.SW"]}')
+        Mock.overrides["finnhub/quote_AAPL.SW"] = (403, b'{"error":"You don\'t have access to this resource."}')
+        it = self.env.items(provider="finnhub")
+        self.assertEqual([i["title"].split()[0] for i in it], ["AAPL", "AAPL.SW"])
+        self.assertEqual(it[1]["subtitle"], "Not available on your Finnhub plan")
+        n = len(Mock.requests)
+        self.env.items(provider="finnhub", STOCKS_TEST_NOW=NOW + 1000)  # no back-off: AAPL refreshes
+        self.assertGreater(len(Mock.requests), n)
+        self.env.set_key("twelvedata")
+        Mock.overrides["twelvedata/quote_VOD"] = (200, b'{"code":403,"message":"**symbol** VOD is available exclusively with pro or enterprise plans.","status":"error"}')
+        self.assertEqual(self.env.items("VOD", provider="twelvedata")[0]["subtitle"], "Not available on your Twelve Data plan")
+
+    def test_alpha_vantage_budget(self):
+        self.env.set_key("alphavantage")
+        for s in ("SPY", "QQQ", "AAPL"):
+            Mock.overrides[f"alphavantage/quote_{s}"] = fixture("alphavantage/quote_IBM")
+        for k in range(5):
+            self.env.items("", provider="alphavantage", STOCKS_TEST_NOW=AAPL_REGULAR + 61 * k)
+        self.assertEqual(len([p for p, _ in Mock.requests if "GLOBAL_QUOTE" in p]), 3)
+
+    def test_twelve_data_batches_and_spaces_refreshes(self):
+        self.env.set_key("twelvedata")
+        self.env.watchlist(json.dumps({"symbols": [f"S{i}" for i in range(12)]}))
+        count = lambda: len([p for p, _ in Mock.requests if p.startswith("/quote")])
+        self.env.items(provider="twelvedata")
+        self.assertEqual(count(), 8)  # 8 credits a minute
+        self.env.items(provider="twelvedata", STOCKS_TEST_NOW=NOW + 30)
+        self.assertEqual(count(), 8)
+        self.env.items(provider="twelvedata", STOCKS_TEST_NOW=NOW + 61)
+        self.assertEqual(count(), 12)  # the 4 never fetched
+
+    def test_search_failure_does_not_poison_the_watchlist(self):
+        self.env.items()
+        Mock.overrides["yahoo/chart_TSLA"] = (500, b"x")
+        self.assertTrue(self.env.items("TSLA", STOCKS_TEST_NOW=NOW + 10)[0]["title"].startswith("Yahoo Finance: server error"))
+        self.assertTrue(self.env.items(STOCKS_TEST_NOW=NOW + 20)[0]["title"].startswith("^GSPC"))
+
+    def test_rate_limited_search_backs_off(self):
+        Mock.overrides["yahoo/search_apple"] = (429, b"Too Many Requests")
+        self.env.items("apple")
+        n = len(Mock.requests)
+        it = self.env.items("tesla", STOCKS_TEST_NOW=NOW + 20)
+        self.assertEqual(len(Mock.requests), n)
+        self.assertTrue(it[0]["title"].startswith("Yahoo Finance: rate limited"))
+        self.assertTrue(self.env.items("tesla", STOCKS_TEST_NOW=NOW + 70)[0]["title"].startswith("TSLA"))
+
+    def test_typed_ticker_quoted_when_search_fails(self):
+        Mock.overrides["yahoo/search_aapl"] = (429, b"Too Many Requests")
+        it = self.env.items("AAPL")
+        self.assertTrue(it[0]["title"].startswith("AAPL   341.07"))
+        self.assertTrue(it[-1]["title"].startswith("Yahoo Finance: rate limited"))
+
+    # --- symbols, formatting, market state
+    def test_us_detection_excludes_exchange_suffixes(self):
+        self.env.set_key("finnhub")
+        Mock.overrides["finnhub/quote_VOD.L"] = fixture("finnhub/quote_AAPL")
+        Mock.overrides["finnhub/quote_BRK.B"] = fixture("finnhub/quote_AAPL")
+        self.assertNotIn("USD", self.env.items("VOD.L", provider="finnhub")[0]["title"])
+        self.assertIn("USD", self.env.items("BRK.B", provider="finnhub")[0]["title"])
+
+    def test_yahoo_share_class_alias(self):
+        it = self.env.items("BRK.B")  # Yahoo: BRK.B is 404, BRK-B is the listing
+        self.assertTrue(it[0]["title"].startswith("BRK-B   505.48 USD"), it[0]["title"])
+
+    def test_fx_decimals_without_price_hint(self):
+        self.env.set_key("twelvedata")
+        body = {"symbol": "EUR/USD", "name": "Euro / US Dollar", "exchange": "Forex", "currency": "", "close": "1.17123",
+                "previous_close": "1.17003", "change": "0.00120", "percent_change": "0.10256", "high": "1.17200",
+                "low": "1.16950", "is_market_open": True}
+        Mock.overrides["twelvedata/quote_" + safe("EUR/USD")] = (200, json.dumps(body).encode())
+        it = self.env.items("EUR/USD", provider="twelvedata")
+        self.assertEqual(it[0]["title"], "EUR/USD   1.1712   ▲ +0.0012 (+0.10%)")
+
+    def test_small_change_never_rounds_to_zero(self):
+        body = json.loads(fixture("yahoo/chart_AAPL")[1])
+        body["chart"]["result"][0]["meta"].update(regularMarketPrice=100.003, previousClose=100.0, priceHint=2)
+        Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps(body).encode())
+        self.assertIn("▲ +0.003 (+0.00%)", self.env.items("AAPL")[0]["title"])
+
+    def test_negative_zero(self):
+        out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "fmt", "-0,2"], cwd=SRC,
+                             env=self.env.vars(), capture_output=True, text=True)
+        self.assertEqual(json.loads(out.stdout), ["0.00"])
+
+    def test_crypto_is_open_around_the_clock(self):
+        self.env.items("BTC-USD")
+        it = self.env.items("BTC-USD", STOCKS_TEST_NOW=NOW + 50)
+        self.assertTrue(it[0]["subtitle"].endswith("Market open"))
+        # past the fixture's "session" (midnight UTC): still open, and on the short TTL
+        n = len(Mock.requests)
+        it = self.env.items("BTC-USD", STOCKS_TEST_NOW=NOW + 12 * 3600)
+        self.assertGreater(len(Mock.requests), n)
+        self.assertIn("Market open", it[0]["subtitle"])
+
+    def test_quote_fetched_before_the_close_is_refetched_soon(self):
+        end = json.loads(fixture("yahoo/chart_AAPL")[1])["chart"]["result"][0]["meta"]["currentTradingPeriod"]["post"]["end"]
+        self.env.items("AAPL", STOCKS_TEST_NOW=end - 30)
+        n = len(Mock.requests)
+        self.env.items("AAPL", STOCKS_TEST_NOW=end + 90)  # closed now, but was open at fetch time: 60 s TTL
+        self.assertGreater(len(Mock.requests), n)
+
+    def test_us_holidays_and_early_closes(self):
+        self.env.set_key("finnhub")
+        thanksgiving = 1795706400  # 2026-11-26 10:20 New York
+        self.assertIn("· Closed", self.env.items("AAPL", provider="finnhub", STOCKS_TEST_NOW=thanksgiving)[0]["subtitle"])
+        early = 1795804200  # 2026-11-27 13:30 New York: the 1 pm early close
+        self.assertIn("After hours", Env().items("AAPL", provider="finnhub", STOCKS_TEST_NOW=early, STOCKS_TEST_KEYCHAIN=self.env.keychain)[0]["subtitle"])
+
+    def test_old_price_shows_its_date(self):
+        self.env.watchlist('{"symbols":["AAPL"]}')
+        it = self.env.items(STOCKS_TEST_NOW=NOW + 86400)  # Sunday: Friday's close
+        self.assertRegex(it[0]["subtitle"], r"Closed · as of Sep 2[56]")
+
+    # --- caches and output
+    def test_array_and_null_caches_are_replaced(self):
+        os.makedirs(self.env.cache, exist_ok=True)
+        with open(os.path.join(self.env.cache, "quotes.json"), "w") as f:
+            f.write("[]")
+        self.env.items()
+        n = len(Mock.requests)
+        self.env.items()
+        self.assertEqual(len(Mock.requests), n)  # the array was replaced: no endless refresh
+        with open(os.path.join(self.env.cache, "searches.json"), "w") as f:
+            json.dump({"yahoo:apple": {"at": NOW, "results": [None]}}, f)
+        self.assertTrue(self.env.items("apple")[0]["title"].startswith("AAPL   341.07"))
+
+    def test_error_text_is_one_line(self):
+        Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps({"chart": {"result": None, "error": {"code": "Internal", "description": "line one\nline two " + "x" * 300}}}).encode())
+        title = self.env.items("AAPL")[0]["title"]
+        self.assertTrue(title.startswith("Yahoo Finance: line one line two"), title)
+        self.assertLessEqual(len(title), 130)
+
+    def test_lone_surrogates_are_replaced(self):
+        Mock.overrides["yahoo/search_surr"] = (200, json.dumps({"quotes": [{"symbol": "GJR", "longname": "Bad \ud800 name &#xD800;", "quoteType": "EQUITY", "isYahooFinance": True}]}).encode("utf-8", "surrogatepass"))
+        out = self.raw("surr")
+        self.assertNotIn(b"\\ud800", out.lower())
+        json.loads(out.decode("utf-8"))  # strict UTF-8
+
+    def test_sparklines_are_pruned(self):
+        self.env.watchlist('{"symbols":["AAPL","^GSPC"]}')
+        spark = os.path.join(self.env.cache, "spark")
+        for k in range(3):
+            self.env.items(STOCKS_TEST_NOW=NOW + 1000 * k)
+            for f in os.listdir(spark):
+                os.utime(os.path.join(spark, f), (time.time() - 60, time.time() - 60))
+        self.env.items(STOCKS_TEST_NOW=NOW + 5000)
+        self.assertEqual(len(os.listdir(spark)), 2)
+
+    def test_concurrent_watchlist_edits(self):
+        self.env.watchlist('{"symbols":[]}')
+        syms = [f"S{i}" for i in range(8)]
+        procs = [subprocess.Popen(["osascript", "-l", "JavaScript", "./stocks.js", "act", s], cwd=SRC,
+                                  env=self.env.vars(stocks_action="toggle"), stdout=subprocess.PIPE) for s in syms]
+        for p in procs:
+            p.communicate(timeout=30)
+        self.assertEqual(sorted(self.env.watchlist()), syms)
+        self.assertFalse(os.path.exists(os.path.join(self.env.data, "watchlist.lock")))
+
+
+@unittest.skipUnless(os.environ.get("STOCKS_KEYCHAIN") == "1", "set STOCKS_KEYCHAIN=1 to test the real Keychain (a throwaway item)")
+class KeychainTests(unittest.TestCase):
+    def test_real_keychain_round_trip(self):
+        env = Env()
+        svc = f"io.github.x-o-r-r-o.stocks.test-{os.getpid()}"
+        v = env.vars(provider="finnhub", alfred_workflow_bundleid=svc, STOCKS_FINNHUB_URL="http://127.0.0.1:9")
+        v.pop("STOCKS_TEST_KEYCHAIN")
+        act = lambda action, key="": subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "act", action], cwd=SRC,
+                                                   env=dict(v, stocks_action=action, stocks_key=key), capture_output=True, text=True).stdout.strip()
+        try:
+            self.assertEqual(act("savekey", "throwaway-key-111111"), "Saved the Finnhub API key")
+            self.assertEqual(act("savekey", "throwaway-key-222222"), "Saved the Finnhub API key")  # update in place
+            out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "filter", ":key"], cwd=SRC, env=v, capture_output=True, text=True).stdout
+            self.assertIn("Remove the saved Finnhub API key", out)
+            self.assertEqual(act("delkey"), "Removed the Finnhub API key")
+            self.assertEqual(act("delkey"), "No API key to remove")
+        finally:
+            subprocess.run(["security", "delete-generic-password", "-s", svc, "-a", "finnhub"], capture_output=True)
+            shutil.rmtree(env.dir, ignore_errors=True)
 
 
 class PlistTests(unittest.TestCase):

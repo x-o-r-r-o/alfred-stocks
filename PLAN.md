@@ -27,7 +27,7 @@ Raycast demand this workflow replaces (downloads, 2026-09-26):
 - [x] Tests against fixtures captured from the real endpoints, a mock server, and an optional live smoke test
 
 ## Tech
-- **Stack:** JXA (`osascript -l JavaScript`) + `/usr/bin/curl` (parallel requests, config on stdin so keys never appear in `ps`) + AppKit drawing for sparklines.
+- **Stack:** JXA (`osascript -l JavaScript`) + `/usr/bin/curl` (parallel requests, config on stdin so keys never appear in `ps`) + AppKit drawing for sparklines + the Security framework for the Keychain (no `security -w KEY` on a command line).
 - **Dependencies:** None. Yahoo Finance needs no key; Finnhub / Twelve Data / Alpha Vantage need a free key.
 - **Provider research (2026-09):** Yahoo retired its official API in 2017 and the `v7/finance/quote` endpoint now needs a cookie + crumb (the failure that broke older workflows). The `v8/finance/chart` and `v1/finance/search` endpoints still answer without one, but return 429 to full browser user agents without cookies, so the workflow sends `Mozilla/5.0`. Finnhub (60 calls/min, US-centric, key in `X-Finnhub-Token`), Twelve Data (8 credits/min, key in `Authorization: apikey`), Alpha Vantage (25 calls/day, key only as a query parameter) are the keyed fallbacks. Adding a provider = one object in `PROVIDERS` (request builders + parsers).
 - Output via Alfred Script Filter JSON; settings via Workflow Configuration (`userconfigurationconfig`).

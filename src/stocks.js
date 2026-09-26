@@ -6,7 +6,9 @@
 //   act <arg>           run the action chosen in Alfred ($stocks_action)
 ObjC.import("Foundation");
 ObjC.import("AppKit");
+ObjC.import("Security");
 ObjC.bindFunction("setsid", ["int", []]);
+ObjC.bindFunction("kill", ["int", ["int", "int"]]);
 
 const ENV = $.NSProcessInfo.processInfo.environment;
 function env(name, fallback) {
@@ -22,7 +24,8 @@ const MISSING_TTL = 60 * 60; // remember unknown symbols for an hour
 const SEARCH_TTL = 24 * 60 * 60;
 const EMPTY_SEARCH_TTL = 10 * 60; // an empty answer may be a glitch: ask again sooner
 const RETRY_AFTER = 60; // seconds before the watchlist retries after a failed refresh
-const LOCK_TTL = 30; // a refresh lock older than this is considered dead
+const LOCK_TTL = 30; // a refresh lock without a live process id is considered dead after this
+const REFRESH_MAX = 300; // …and one whose process is still alive after this (it can take 7 × 8 s for 50 slow symbols)
 const MAX_WATCHLIST = 50;
 const SYMBOL_RE = /^[A-Z0-9^][A-Z0-9.^=\-:\/_&]{0,31}$/;
 
@@ -70,7 +73,7 @@ function readJSON(path, fallback) {
   if (t === null) return fallback;
   try {
     const v = JSON.parse(t);
-    return v && typeof v === "object" ? v : fallback;
+    return v && typeof v === "object" && !Array.isArray(v) ? v : fallback; // an array would never be rewritten
   } catch (e) {
     return fallback;
   }
@@ -111,7 +114,11 @@ function exec(path, args, input) {
   return { status: task.terminationStatus, stdout: str(out), stderr: str(err) };
 }
 
-// Start a detached process (stdout/stderr to /dev/null so Alfred doesn't wait for it).
+function alive(pid) {
+  return Number.isInteger(pid) && pid > 1 && $.kill(pid, 0) === 0;
+}
+
+// Start a detached process (stdout/stderr to /dev/null so Alfred doesn't wait for it); returns its pid or 0.
 function spawn(path, args) {
   const task = $.NSTask.alloc.init;
   task.executableURL = $.NSURL.fileURLWithPath(path);
@@ -120,7 +127,7 @@ function spawn(path, args) {
   task.standardInput = nul;
   task.standardOutput = nul;
   task.standardError = nul;
-  return task.launchAndReturnError($());
+  return task.launchAndReturnError($()) ? task.processIdentifier : 0;
 }
 
 // ---------- HTTP (curl ships with macOS) ----------
@@ -134,13 +141,13 @@ function cfg(s) {
 
 // Fetch several requests in parallel. The config (URLs, headers, API keys) goes to curl on
 // stdin, so nothing secret shows up in the process list. Returns [{status, body, exit, error}].
-function httpMany(reqs) {
+function httpMany(reqs, parallel = 8) {
   if (!reqs.length) return [];
   // Alfred kills a running Script Filter when the query changes: remove what such runs left behind
   const t = Date.now() / 1000;
   for (const f of listDir(cacheDir())) if (f.startsWith("tmp-") && t - mtime(`${cacheDir()}/${f}`) > 120) FM.removeItemAtPathError(`${cacheDir()}/${f}`, $());
   const dir = mkdirs(`${cacheDir()}/tmp-${$.NSUUID.UUID.UUIDString.js}`);
-  const lines = ["parallel", "parallel-max = 8"];
+  const lines = parallel > 1 ? ["parallel", `parallel-max = ${parallel}`] : [];
   reqs.forEach((r, i) => {
     if (i) lines.push("next");
     lines.push(`url = ${cfg(r.url)}`, `output = ${cfg(`${dir}/${i}`)}`, "silent", "compressed",
@@ -170,8 +177,9 @@ function httpMany(reqs) {
 class ProviderError extends Error {
   constructor(kind, message, status) {
     super(message);
-    this.kind = kind; // auth | rate | network | server | parse | nokey
+    this.kind = kind; // auth | rate | network | server | parse | nokey | plan (this symbol isn't on your plan)
     this.status = status || 0;
+    this.until = 0; // back off until then (epoch seconds), when the provider says how long
   }
 }
 
@@ -181,6 +189,8 @@ function parseBody(p, r, { notFoundOk = false } = {}) {
     const why = { 6: "can’t find the server", 7: "can’t connect", 28: "timed out", 35: "secure connection failed", 60: "certificate problem" }[r.exit];
     throw new ProviderError("network", why || `network error (${redact(r.error) || "curl " + r.exit})`);
   }
+  // keyed providers answer 403 for one symbol the free plan doesn't cover (Finnhub: non-US symbols); 401 is the key
+  if (r.status === 403 && p.needsKey) throw new ProviderError("plan", "not available on your plan", r.status);
   if (r.status === 401 || r.status === 403) throw new ProviderError("auth", p.needsKey ? "API key rejected" : "access denied", r.status);
   if (r.status === 429) throw new ProviderError("rate", "rate limited", r.status);
   if ((r.status === 404 || r.status === 400) && notFoundOk) return null; // Yahoo: 404 for unknown/delisted symbols
@@ -219,27 +229,39 @@ function name(v) {
   return str(v).replace(/&(#x[0-9a-f]{1,6}|#\d{1,7}|[a-z]{2,5});/gi, (m, e) => {
     if (e[0] !== "#") return ents[e.toLowerCase()] || m;
     const n = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
-    return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : m;
+    return n > 0 && n <= 0x10ffff && (n < 0xd800 || n > 0xdfff) ? String.fromCodePoint(n) : m;
   });
 }
 
 // ---------- market state ----------
 
-// US equity sessions in New York time (holidays aren't known: they show as regular).
+// NYSE/Nasdaq holidays and 1 pm early closes (nyse.com/markets/hours-calendars). Later years fall back
+// to the weekday rule; Yahoo Finance and Twelve Data report holidays themselves.
+const US_HOLIDAYS = new Set([
+  "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+  "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+]);
+const US_EARLY_CLOSE = new Set(["2026-11-27", "2026-12-24", "2027-11-26"]);
+const NY_PARTS = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit", weekday: "short", hour: "numeric", minute: "numeric", hourCycle: "h23" });
+
+// US equity sessions in New York time.
 function usState(t) {
   const parts = {};
-  for (const p of new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "numeric", hourCycle: "h23" })
-    .formatToParts(new Date(t * 1000))) parts[p.type] = p.value;
-  if (parts.weekday === "Sat" || parts.weekday === "Sun") return "CLOSED";
+  for (const p of NY_PARTS.formatToParts(new Date(t * 1000))) parts[p.type] = p.value;
+  const day = `${parts.year}-${parts.month}-${parts.day}`;
+  if (parts.weekday === "Sat" || parts.weekday === "Sun" || US_HOLIDAYS.has(day)) return "CLOSED";
   const m = Number(parts.hour) * 60 + Number(parts.minute);
-  return m >= 240 && m < 570 ? "PRE" : m >= 570 && m < 960 ? "REGULAR" : m >= 960 && m < 1200 ? "POST" : "CLOSED";
+  const close = US_EARLY_CLOSE.has(day) ? 780 : 960; // 1 pm on early-close days
+  return m >= 240 && m < 570 ? "PRE" : m >= 570 && m < close ? "REGULAR" : m >= close && m < close + 240 ? "POST" : "CLOSED";
 }
+// a US ticker, optionally with a share class (BRK.B, BF-B); not VOD.L, BMW.F or ABC.V (exchange suffixes)
 function looksUS(sym) {
-  return /^[A-Z]{1,5}([.\-][A-Z])?$/.test(sym);
+  return /^[A-Z]{1,5}([.\-][A-C])?$/.test(sym);
 }
 
 // State of a cached quote at time t (computed at display time, so a cached quote doesn't lie).
 function stateOf(q, t) {
+  if (q.h24) return "REGULAR"; // crypto trades around the clock (its Yahoo "session" ends at midnight UTC)
   if (q.periods) {
     const inside = (p) => p && t >= p.start && t < p.end;
     return inside(q.periods.regular) ? "REGULAR" : inside(q.periods.pre) ? "PRE" : inside(q.periods.post) ? "POST" : "CLOSED";
@@ -249,7 +271,7 @@ function stateOf(q, t) {
     const live = usState(t);
     return live === "REGULAR" && q.open === false && usState(q.fetched) === "REGULAR" && t - q.fetched < 8 * 3600 ? "CLOSED" : live;
   }
-  return q.state || null;
+  return q.state && t - q.fetched < 3600 ? q.state : null; // a provider's open/closed flag goes stale
 }
 
 const STATE_LABEL = { PRE: "Pre-market", REGULAR: "Market open", POST: "After hours", CLOSED: "Closed" };
@@ -268,6 +290,8 @@ const PROVIDERS = {
     needsKey: false,
     searchQuotes: 8,
     base: () => env("STOCKS_YAHOO_URL", "https://query1.finance.yahoo.com"),
+    // Yahoo writes share classes with a dash: BRK.B is 404, BRK-B is Berkshire Hathaway B
+    alias: (sym) => sym.replace(/^([A-Z]{1,5})\.([A-C])$/, "$1-$2"),
     searchReq(q) {
       return { url: `${this.base()}/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=10&newsCount=0&listsCount=0`, ua: YAHOO_UA };
     },
@@ -285,7 +309,7 @@ const PROVIDERS = {
       if (!c || typeof c !== "object") throw new ProviderError("parse", "unexpected quote response");
       if (c.error) {
         if (/not found|delisted/i.test(`${c.error.code} ${c.error.description}`)) return null;
-        throw new ProviderError("server", str(c.error.description) || "quote error");
+        throw new ProviderError("server", oneLine(str(c.error.description), 80) || "quote error");
       }
       const r = Array.isArray(c.result) ? c.result[0] : null;
       if (!r || !r.meta) return null;
@@ -310,6 +334,7 @@ const PROVIDERS = {
         hint: num(m.priceHint),
         time: num(m.regularMarketTime),
         periods: p && typeof p === "object" ? { pre: period(p.pre), regular: period(p.regular), post: period(p.post) } : null,
+        h24: str(m.instrumentType) === "CRYPTOCURRENCY",
         series,
       };
     },
@@ -321,12 +346,13 @@ const PROVIDERS = {
     needsKey: true,
     keyURL: "https://finnhub.io/register",
     searchQuotes: 6, // free plan: 60 calls/minute
+    batch: 30,
     base: () => env("STOCKS_FINNHUB_URL", "https://finnhub.io/api/v1"),
     searchReq(q, key) {
       return { url: `${this.base()}/search?q=${encodeURIComponent(q)}`, headers: { "X-Finnhub-Token": key } };
     },
     parseSearch(v) {
-      if (v.error) throw new ProviderError("auth", redact(str(v.error)) || "API error");
+      if (v.error) throw new ProviderError(/limit/i.test(v.error) ? "rate" : "auth", oneLine(redact(str(v.error)), 80) || "API error");
       if (!Array.isArray(v.result)) throw new ProviderError("parse", "unexpected search response");
       return v.result
         .filter((x) => x && typeof x.symbol === "string")
@@ -336,14 +362,14 @@ const PROVIDERS = {
       return { url: `${this.base()}/quote?symbol=${encodeURIComponent(sym)}`, headers: { "X-Finnhub-Token": key } };
     },
     parseQuote(sym, v) {
-      if (v.error) throw new ProviderError(/limit/i.test(v.error) ? "rate" : "auth", redact(str(v.error)));
+      if (v.error) throw new ProviderError(/limit/i.test(v.error) ? "rate" : /access/i.test(v.error) ? "plan" : "auth", oneLine(redact(str(v.error)), 80));
       const price = num(v.c);
       // unknown symbols come back as all zeros with null change
       if (price === null || (price === 0 && !num(v.t) && num(v.d) === null)) return null;
       const us = looksUS(sym);
       return {
         symbol: sym, name: "", price, prev: num(v.pc), change: num(v.d), pct: num(v.dp), low: num(v.l), high: num(v.h),
-        currency: us ? "USD" : "", exchange: "", type: "", time: num(v.t), usHours: us,
+        currency: us ? "USD" : "", exchange: "", type: "", time: num(v.t), usHours: us, hint: fxHint(sym),
       };
     },
   },
@@ -353,7 +379,12 @@ const PROVIDERS = {
     name: "Alpha Vantage",
     needsKey: true,
     keyURL: "https://www.alphavantage.co/support/#api-key",
-    searchQuotes: 1, // free plan: 25 calls/day
+    searchQuotes: 1, // free plan: 25 calls/day, so quotes are kept for hours and fetched one at a time
+    minTTL: 3 * 3600,
+    closedTTL: 12 * 3600,
+    batch: 5,
+    gap: 60,
+    parallel: 1,
     base: () => env("STOCKS_ALPHAVANTAGE_URL", "https://www.alphavantage.co"),
     // Alpha Vantage only accepts the key as a query parameter; the URL goes to curl on stdin
     searchReq(q, key) {
@@ -362,7 +393,12 @@ const PROVIDERS = {
     check(v) {
       // errors and rate limits arrive as HTTP 200 with a message
       const msg = str(v.Note) || str(v.Information);
-      if (msg) throw new ProviderError(/api key|apikey/i.test(msg) && !/rate|limit|frequency|per day/i.test(msg) ? "auth" : "rate", /rate|limit|frequency|per day/i.test(msg) ? "rate limit reached (25 requests a day on the free plan)" : "API key rejected");
+      if (msg && /per day|daily/i.test(msg)) {
+        const e = new ProviderError("rate", "daily limit reached (25 requests a day on the free plan)");
+        e.until = (Math.floor(now() / 86400) + 1) * 86400; // the quota resets at 00:00 UTC
+        throw e;
+      }
+      if (msg) throw new ProviderError(/api key|apikey/i.test(msg) && !/rate|limit|frequency/i.test(msg) ? "auth" : "rate", /rate|limit|frequency/i.test(msg) ? "rate limit reached" : "API key rejected");
       if (v["Error Message"]) throw new ProviderError(/apikey|api key/i.test(v["Error Message"]) ? "auth" : "server", /apikey|api key/i.test(v["Error Message"]) ? "API key rejected" : "request rejected");
     },
     parseSearch(v) {
@@ -385,7 +421,7 @@ const PROVIDERS = {
       const us = looksUS(sym);
       return {
         symbol: sym, name: "", price, prev: num(g["08. previous close"]), change: num(g["09. change"]), pct: num(g["10. change percent"]),
-        low: num(g["04. low"]), high: num(g["03. high"]), currency: us ? "USD" : "", exchange: "", type: "", usHours: us,
+        low: num(g["04. low"]), high: num(g["03. high"]), currency: us ? "USD" : "", exchange: "", type: "", usHours: us, hint: fxHint(sym),
       };
     },
   },
@@ -395,7 +431,10 @@ const PROVIDERS = {
     name: "Twelve Data",
     needsKey: true,
     keyURL: "https://twelvedata.com/pricing",
-    searchQuotes: 4, // free plan: 8 credits/minute
+    searchQuotes: 4, // free plan: 8 credits a minute, 800 a day
+    minTTL: 5 * 60,
+    batch: 8,
+    gap: 60,
     base: () => env("STOCKS_TWELVEDATA_URL", "https://api.twelvedata.com"),
     searchReq(q, key) {
       return { url: `${this.base()}/symbol_search?symbol=${encodeURIComponent(q)}&outputsize=10`, headers: { Authorization: `apikey ${key}` } };
@@ -403,10 +442,11 @@ const PROVIDERS = {
     check(v) {
       if (v.status === "error") {
         const code = num(v.code);
-        if (code === 401 || code === 403) throw new ProviderError("auth", "API key rejected");
+        if (code === 401) throw new ProviderError("auth", "API key rejected");
+        if (code === 403) throw new ProviderError("plan", "not available on your plan"); // "available exclusively with pro…"
         if (code === 429) throw new ProviderError("rate", "rate limit reached (8 requests a minute on the free plan)");
         if (code === 404 || code === 400) return "notfound";
-        throw new ProviderError("server", redact(str(v.message)).slice(0, 80) || "API error");
+        throw new ProviderError("server", oneLine(redact(str(v.message)), 80) || "API error");
       }
     },
     parseSearch(v) {
@@ -428,6 +468,7 @@ const PROVIDERS = {
         symbol: sym, name: name(v.name), price, prev: num(v.previous_close), change: num(v.change), pct: num(v.percent_change),
         low: num(v.low), high: num(v.high), currency: str(v.currency), exchange: str(v.exchange), type: "",
         time: num(v.last_quote_at) !== null ? num(v.last_quote_at) : num(v.timestamp),
+        hint: fxHint(sym),
       };
       if (us) Object.assign(q, { usHours: true, open: v.is_market_open === true ? true : v.is_market_open === false ? false : undefined });
       else if (typeof v.is_market_open === "boolean") q.state = v.is_market_open ? "REGULAR" : "CLOSED";
@@ -436,23 +477,76 @@ const PROVIDERS = {
   },
 };
 
+// keyed providers send no price precision: currency pairs (EUR/USD, OANDA:EUR_USD) need 4 decimals
+function fxHint(sym) {
+  const m = sym.match(/^(?:[A-Z]+:)?[A-Z]{3}[\/_]([A-Z]{3})$/);
+  return m ? (m[1] === "JPY" ? 3 : 4) : null;
+}
+
 function provider() {
   return PROVIDERS[env("provider", "yahoo")] || PROVIDERS.yahoo;
 }
 
 // ---------- keychain ----------
+// Security framework through the ObjC bridge, so the key never appears in a process's arguments
+// (`security add-generic-password -w KEY` would show it in `ps`). Dictionary keys are the string
+// values of kSecClass ("class"), kSecAttrService ("svce"), kSecAttrAccount ("acct") and so on.
 
-const SECURITY = env("STOCKS_SECURITY", "/usr/bin/security"); // test suite only: a fake that doesn't touch your keychains
+const ERR_NOT_FOUND = -25300; // errSecItemNotFound
 
+// test suite only: a directory standing in for the keychain (<service>.<account> files)
+function testKeyPath(p) {
+  const dir = env("STOCKS_TEST_KEYCHAIN", "");
+  return dir ? `${dir}/${BUNDLE}.${p.id}` : null;
+}
+function kcQuery(p) {
+  const d = $.NSMutableDictionary.alloc.init;
+  d.setObjectForKey($("genp"), $("class"));
+  d.setObjectForKey($(BUNDLE), $("svce"));
+  d.setObjectForKey($(p.id), $("acct"));
+  return d;
+}
 function getKey(p) {
-  const r = exec(SECURITY, ["find-generic-password", "-s", BUNDLE, "-a", p.id, "-w"]);
-  return r.status === 0 ? r.stdout.replace(/\n$/, "") : "";
+  const t = testKeyPath(p);
+  if (t) return (readFile(t) || "").trim();
+  const q = kcQuery(p);
+  q.setObjectForKey($.NSNumber.numberWithBool(true), $("r_Data"));
+  q.setObjectForKey($("m_LimitOne"), $("m_Limit"));
+  const r = Ref();
+  if ($.SecItemCopyMatching(q, r) !== 0 || !r[0]) return "";
+  const s = $.NSString.alloc.initWithDataEncoding(ObjC.castRefToObject(r[0]), $.NSUTF8StringEncoding);
+  return s.isNil() ? "" : s.js.trim();
 }
 function setKey(p, key) {
-  return exec(SECURITY, ["add-generic-password", "-U", "-s", BUNDLE, "-a", p.id, "-l", `${p.name} API key (Alfred Stocks)`, "-w", key]).status === 0;
+  const t = testKeyPath(p);
+  if (t) return writeFile(t, key);
+  const data = $(key).dataUsingEncoding($.NSUTF8StringEncoding);
+  const q = kcQuery(p);
+  const upd = $.NSMutableDictionary.alloc.init;
+  upd.setObjectForKey(data, $("v_Data"));
+  let status = $.SecItemUpdate(q, upd);
+  if (status === ERR_NOT_FOUND) {
+    q.setObjectForKey(data, $("v_Data"));
+    q.setObjectForKey($(`${p.name} API key (Alfred Stocks)`), $("labl"));
+    status = $.SecItemAdd(q, null);
+  }
+  return status === 0;
 }
 function deleteKey(p) {
-  return exec(SECURITY, ["delete-generic-password", "-s", BUNDLE, "-a", p.id]).status === 0;
+  const t = testKeyPath(p);
+  if (t) {
+    if (!exists(t)) return false;
+    removeFile(t);
+    return true;
+  }
+  return $.SecItemDelete(kcQuery(p)) === 0;
+}
+// plain text on the clipboard ("" when there is none); the test suite stands in with STOCKS_TEST_CLIPBOARD
+function clipboardText() {
+  const t = env("STOCKS_TEST_CLIPBOARD", null);
+  if (t !== null) return t.trim();
+  const s = $.NSPasteboard.generalPasteboard.stringForType($.NSPasteboardTypeString);
+  return s.isNil() ? "" : s.js.trim();
 }
 function validKey(k) {
   return /^[A-Za-z0-9._\-]{8,128}$/.test(k);
@@ -460,9 +554,16 @@ function validKey(k) {
 
 // ---------- formatting ----------
 
+// The system's formatting locale. Formats follow the region, which may differ from the language's:
+// "en_US@rg=dezzzz" (English, region Germany) formats as en-DE (1.234,5), not en-US.
 function systemLocale() {
-  const id = $.NSLocale.currentLocale.localeIdentifier.js; // e.g. "de_CH" or "en_US@rg=dezzzz"
-  return id.split("@")[0].replace(/_/g, "-");
+  const l = $.NSLocale.currentLocale;
+  const part = (k) => {
+    const v = l.objectForKey(k);
+    return v.isNil() ? "" : v.js;
+  };
+  const tag = [part($.NSLocaleLanguageCode), part($.NSLocaleScriptCode), part($.NSLocaleCountryCode)].filter(Boolean).join("-");
+  return tag || l.localeIdentifier.js.split("@")[0].replace(/_/g, "-");
 }
 
 const LOCALE = (() => {
@@ -501,11 +602,15 @@ function decimals(price, hint) {
 function fmtPrice(v, hint, grouping = true) {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
   const d = decimals(v, hint);
-  return nf(d.min, d.max, grouping).format(v);
+  return nf(d.min, d.max, grouping).format(unsignedZero(v));
 }
 
 function signed(s, v) {
   return v > 0 ? "+" + s : s;
+}
+// -0 (from "-0.00" in an API) would print as "-0.00"
+function unsignedZero(v) {
+  return v === 0 ? 0 : v;
 }
 
 // a change uses the price's decimals; below 1 it may need more to stay visible (SHIB: -0.0000000353)
@@ -517,12 +622,15 @@ function fmtChange(v, price, hint) {
     const c = decimals(v, hint);
     d.max = Math.max(d.max, c.max);
   }
-  return signed(nf(d.min, d.max).format(v), v);
+  // a real move shouldn't print as +0.00 (FX without a price hint: +0.0012)
+  while (v !== 0 && d.max < 8 && Math.abs(v) < 0.5 * 10 ** -d.max) d.max++;
+  d.min = Math.min(d.min, d.max);
+  return signed(nf(d.min, d.max).format(unsignedZero(v)), v);
 }
 
 function fmtPct(v) {
   if (v === null || !Number.isFinite(v)) return "—";
-  return signed(nf(2, 2).format(v), v) + "%";
+  return signed(nf(2, 2).format(unsignedZero(v)), v) + "%";
 }
 
 function fmtTime(t, ref) {
@@ -592,6 +700,7 @@ const quotesPath = () => `${cacheDir()}/quotes.json`;
 const searchPath = () => `${cacheDir()}/searches.json`;
 const statusPath = () => `${cacheDir()}/status.json`;
 const lockPath = () => `${cacheDir()}/refresh.lock`;
+const lastRefreshPath = () => `${cacheDir()}/last-refresh.json`;
 const sparkDir = () => mkdirs(`${cacheDir()}/spark`);
 
 // {SYMBOL: entry}; entries from another provider are ignored
@@ -612,25 +721,44 @@ function saveQuotes(entries) {
 
 function ttl(e, t) {
   if (e.missing) return MISSING_TTL;
-  const s = stateOf(e, t);
-  return s === "CLOSED" ? CLOSED_TTL : OPEN_TTL;
+  const p = PROVIDERS[e.provider] || provider();
+  // the long TTL only when the market was already closed at fetch time: a quote fetched just before
+  // the close (or before FX's daily 1-minute break) is fetched again to pick up the new session
+  const closed = stateOf(e, t) === "CLOSED" && stateOf(e, e.fetched) === "CLOSED";
+  // keyed free plans have small budgets (Alpha Vantage: 25 requests a day)
+  return Math.max(closed ? Math.max(CLOSED_TTL, p.closedTTL || 0) : OPEN_TTL, p.minTTL || 0);
 }
 function fresh(e, t) {
   // a timestamp from the future (the clock was changed) doesn't keep a quote fresh forever
   return !!e && e.fetched <= t + 60 && t - e.fetched < ttl(e, t);
 }
 
+// The provider-wide state shown on the watchlist: the last refresh's error (or a rate limit or rejected key
+// met by a search), and how long to back off before trying again.
 function setStatus(err) {
-  writeFile(statusPath(), JSON.stringify(err ? { provider: provider().id, at: now(), kind: err.kind, message: redact(err.message), status: err.status } : { provider: provider().id, at: now(), ok: true }));
+  const t = now();
+  writeFile(statusPath(), JSON.stringify(err
+    ? { provider: provider().id, at: t, until: Math.max(err.until || 0, t + RETRY_AFTER), kind: err.kind, message: oneLine(redact(err.message), 100), status: err.status }
+    : { provider: provider().id, at: t, ok: true }));
 }
 function lastError() {
-  const s = readJSON(statusPath(), {});
-  return s.provider === provider().id && !s.ok && s.message ? s : null;
+  const s = readJSON(statusPath(), {}), t = now();
+  if (s.provider !== provider().id || s.ok || typeof s.message !== "string" || !s.message || typeof s.at !== "number") return null;
+  if (t < s.at - 60 || (t - s.at > 3600 && !(t < s.until))) return null; // from the future (clock change) or long gone
+  return s;
+}
+function backingOff(err) {
+  return !!err && now() < (typeof err.until === "number" ? err.until : err.at + RETRY_AFTER);
 }
 
 function refreshRunning() {
   const l = readJSON(lockPath(), null);
-  return !!l && now() - (l.started || 0) < LOCK_TTL && Date.now() / 1000 - mtime(lockPath()) < LOCK_TTL;
+  if (!l) return false;
+  const a1 = now() - (Number(l.started) || 0), a2 = Date.now() / 1000 - mtime(lockPath());
+  if (a1 < -60 || a2 < -60) return false; // started "in the future": the clock was changed
+  const age = Math.max(a1, a2);
+  // a refresh that Alfred killed (or that crashed) must not block the next one; a slow live one must not start a second
+  return typeof l.pid === "number" ? alive(l.pid) && age < REFRESH_MAX : age < LOCK_TTL;
 }
 
 // ---------- sparklines ----------
@@ -685,14 +813,15 @@ function drawSparkline(series, prev, up, path) {
 
 // ---------- fetching ----------
 
-// Fetch quotes for symbols; returns {entries, error}. Entries are cached (with sparklines).
+// Fetch quotes for symbols; returns {entries, error, allFailed}. Entries are cached (with sparklines).
+// A symbol the plan doesn't cover is cached as unavailable, not reported as an error.
 function fetchQuotes(symbols, names = {}) {
   const p = provider();
   const key = p.needsKey ? KEY || (KEY = getKey(p)) : "";
-  if (p.needsKey && !key) return { entries: {}, error: new ProviderError("nokey", "no API key") };
-  const resps = httpMany(symbols.map((s) => p.quoteReq(s, key)));
+  if (p.needsKey && !key) return { entries: {}, error: new ProviderError("nokey", "no API key"), allFailed: true };
+  const resps = httpMany(symbols.map((s) => p.quoteReq(s, key)), p.parallel || 8);
   const t = now(), old = loadQuotes(), entries = {};
-  let error = null;
+  let error = null, failed = 0;
   const sparks = enabled("sparklines", true);
   resps.forEach((r, i) => {
     const sym = symbols[i];
@@ -716,13 +845,17 @@ function fetchQuotes(symbols, names = {}) {
       entries[sym] = q;
     } catch (e) {
       if (!(e instanceof ProviderError)) e = new ProviderError("parse", "unexpected response");
+      if (e.kind === "plan") {
+        entries[sym] = { symbol: sym, provider: p.id, fetched: t, missing: true, plan: true };
+        return;
+      }
+      failed++;
       error = error || e;
     }
   });
   saveQuotes(entries);
   pruneSparklines(entries);
-  setStatus(error); // a successful fetch (search or refresh) clears the watchlist's error row
-  return { entries, error };
+  return { entries, error, allFailed: failed > 0 && failed === symbols.length };
 }
 
 // keep only the newest sparkline per symbol (Alfred caches icons by path, so each refresh writes a new file)
@@ -741,8 +874,15 @@ function search(q) {
   const p = provider();
   const k = `${p.id}:${q.toLowerCase()}`;
   const cache = readJSON(searchPath(), {});
+  for (const [ck, v] of Object.entries(cache)) if (!v || typeof v !== "object" || typeof v.at !== "number" || !Array.isArray(v.results)) delete cache[ck];
   const hit = cache[k];
-  if (hit && Array.isArray(hit.results) && now() - hit.at < (hit.results.length ? SEARCH_TTL : EMPTY_SEARCH_TTL) && hit.at <= now() + 60) return hit.results;
+  if (hit && now() - hit.at < (hit.results.length ? SEARCH_TTL : EMPTY_SEARCH_TTL) && hit.at <= now() + 60) {
+    const valid = hit.results.filter((r) => r && typeof r === "object" && typeof r.symbol === "string" && SYMBOL_RE.test(r.symbol));
+    if (valid.length === hit.results.length) return valid.map((r) => ({ symbol: r.symbol, name: str(r.name), exchange: str(r.exchange), type: str(r.type) }));
+  }
+  // after a rate limit, don't ask again on every keystroke
+  const err = lastError();
+  if (err && err.kind === "rate" && backingOff(err)) throw Object.assign(new ProviderError("rate", err.message, err.status), { until: err.until, recorded: true });
   const key = p.needsKey ? KEY || (KEY = getKey(p)) : "";
   let results = p.parseSearch(parseBody(p, httpMany([p.searchReq(q, key)])[0]));
   const plain = q.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
@@ -792,6 +932,25 @@ function loadWatchlist() {
   return { symbols: salvaged, damaged: true };
 }
 
+// Serialise read-modify-write edits (two quick ⌥↩ in a row, or an edit while another runs): mkdir is
+// atomic. A lock left by a killed process is taken over after a few seconds.
+function withWatchlistLock(fn) {
+  const dir = `${dataDir()}/watchlist.lock`;
+  const until = Date.now() + 3000;
+  let got = false;
+  while (!(got = FM.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, false, $(), $()))) {
+    const age = Date.now() / 1000 - mtime(dir);
+    if (exists(dir) && (age > 10 || age < -60)) removeFile(dir);
+    else if (Date.now() > until) break;
+    else $.NSThread.sleepForTimeInterval(0.05);
+  }
+  try {
+    return fn();
+  } finally {
+    if (got) removeFile(dir);
+  }
+}
+
 function saveWatchlist(symbols) {
   const path = watchlistPath();
   if (exists(path) && loadWatchlist().damaged) // keep a backup of an unreadable file
@@ -823,7 +982,8 @@ function errorItem(err, p) {
     nokey: "↩ Set your API key",
   };
   const sub = hints[err.kind] || "The service may have changed or be down. ↩ Pick another provider in the Workflow’s Configuration";
-  const title = `${p.name}: ${redact(err.message)}${err.status && !/\d{3}/.test(err.message) ? ` (HTTP ${err.status})` : ""}`;
+  const msg = oneLine(redact(err.message), 100); // provider text: may hold newlines or be long
+  const title = `${p.name}: ${msg}${err.status && !/\d{3}/.test(msg) ? ` (HTTP ${err.status})` : ""}`;
   if ((err.kind === "auth" && p.needsKey) || err.kind === "nokey")
     return info(title, sub, "error", { valid: false, autocomplete: ":key " });
   if (err.kind === "network") return info(title, sub, "error");
@@ -841,7 +1001,9 @@ function quoteItem(q, t, inWatchlist, watchMode) {
   if (q.exchange) parts.push(q.exchange);
   if (q.low !== null && q.low !== undefined && q.high !== null && q.high !== undefined) parts.push(`Day ${fmtPrice(q.low, q.hint)} – ${fmtPrice(q.high, q.hint)}`);
   if (state) parts.push(STATE_LABEL[state]);
-  if (t - q.fetched > ttl(q, t) * 3) parts.push(`as of ${fmtTime(q.fetched, t)}`);
+  // the last trade's time when the quote is stale or the price is from an earlier day (a weekend, a halt)
+  const asOf = typeof q.time === "number" && q.time > 0 && q.time <= q.fetched + 60 ? q.time : q.fetched;
+  if (t - q.fetched > ttl(q, t) * 3 || t - asOf > 20 * 3600) parts.push(`as of ${fmtTime(asOf, t)}`);
   const url = siteURL(q.symbol, q);
   const plain = fmtPrice(q.price, q.hint, false);
   const iconPath = q.spark && enabled("sparklines", true) && exists(q.spark) ? { path: q.spark } : icon(change === null || change === 0 ? "flat" : change > 0 ? "up" : "down");
@@ -893,18 +1055,27 @@ function plainItem(sym, meta, inWatchlist, watchMode, subtitle) {
   return item;
 }
 
+// A watchlist refresh: its outcome is what the watchlist's error row and back-off are based on.
+function refreshQuotes(symbols) {
+  writeFile(lastRefreshPath(), JSON.stringify({ provider: provider().id, at: now() }));
+  setStatus(fetchQuotes(symbols).error);
+}
+
 function startRefresh(symbols) {
   if (env("STOCKS_SYNC", "0") === "1") {
     // test suite only: refresh in-process
-    fetchQuotes(symbols);
+    refreshQuotes(symbols);
     return false;
   }
   writeFile(lockPath(), JSON.stringify({ started: now(), symbols }));
   const script = `${FM.currentDirectoryPath.js}/stocks.js`;
-  if (!spawn("/usr/bin/osascript", ["-l", "JavaScript", script, "refresh", ...symbols])) {
+  const pid = spawn("/usr/bin/osascript", ["-l", "JavaScript", script, "refresh", ...symbols]);
+  if (!pid) {
     removeFile(lockPath());
     return false;
   }
+  const l = readJSON(lockPath(), null); // the refresh may have written its own lock already (or finished)
+  if (l && !l.pid) writeFile(lockPath(), JSON.stringify({ started: l.started, symbols, pid }));
   return true;
 }
 
@@ -919,13 +1090,15 @@ function watchlistItems() {
     return { items };
   }
   let quotes = loadQuotes();
-  const stale = wl.symbols.filter((s) => !fresh(quotes[s], t));
+  // the oldest first, a batch at a time: keyed free plans allow a few requests a minute
+  const stale = wl.symbols.filter((s) => !fresh(quotes[s], t)).sort((a, b) => ((quotes[a] || {}).fetched || 0) - ((quotes[b] || {}).fetched || 0));
   let running = refreshRunning();
-  const err0 = lastError();
   // after a failure, wait before trying again: with rerun this would otherwise hammer a rate-limited API
-  const backoff = err0 && t - err0.at >= 0 && t - err0.at < RETRY_AFTER;
-  if (stale.length && !running && !backoff) {
-    running = startRefresh(stale);
+  const backoff = backingOff(lastError());
+  const last = readJSON(lastRefreshPath(), {});
+  const tooSoon = p.gap && last.provider === p.id && t >= last.at && t - last.at < p.gap;
+  if (stale.length && !running && !backoff && !tooSoon) {
+    running = startRefresh(stale.slice(0, p.batch || MAX_WATCHLIST));
     quotes = loadQuotes();
   }
   const err = lastError();
@@ -933,7 +1106,7 @@ function watchlistItems() {
   for (const s of wl.symbols) {
     const q = quotes[s];
     if (q && !q.missing) items.push(quoteItem(q, t, true, true));
-    else if (q && q.missing) items.push(plainItem(s, null, true, true, `No data from ${p.name}: unknown or delisted symbol`));
+    else if (q && q.missing) items.push(plainItem(s, null, true, true, q.plan ? `Not available on your ${p.name} plan` : `No data from ${p.name}: unknown or delisted symbol`));
     else items.push(plainItem(s, null, true, true, running ? "Loading…" : "No quote yet"));
   }
   return running ? { items, rerun: 0.5 } : { items };
@@ -942,7 +1115,8 @@ function watchlistItems() {
 function searchItems(query) {
   const p = provider(), t = now();
   const wl = new Set(loadWatchlist().symbols);
-  const typed = query.trim().toUpperCase();
+  const upper = query.trim().toUpperCase();
+  const typed = p.alias ? p.alias(upper) : upper;
   const typedIsSymbol = !/\s/.test(typed) && typed.length <= 15 && SYMBOL_RE.test(typed);
   let results, error = null;
   try {
@@ -961,28 +1135,41 @@ function searchItems(query) {
   const q0 = query.trim();
   if (typedIsSymbol && meta[typed]) symbols.splice(0, symbols.length, typed, ...symbols.filter((s) => s !== typed));
   else if (typedIsSymbol && q0 === q0.toUpperCase()) symbols.unshift(typed);
-  else if (typedIsSymbol) symbols.push(typed);
+  else if (typedIsSymbol && !(error && error.kind === "rate")) symbols.push(typed); // rate limited: only a ticker typed in capitals
   const wanted = symbols.slice(0, p.searchQuotes);
   let quotes = loadQuotes();
   const stale = wanted.filter((s) => !fresh(quotes[s], t));
-  if (stale.length && !error) {
+  // a rate limit or rejected key applies to every request; after a failed search (Yahoo: another
+  // endpoint) a typed ticker is still quoted
+  const blocked = error && (["auth", "nokey", "network"].includes(error.kind) || (error.kind === "rate" && p.needsKey));
+  if (error && !error.recorded && ["rate", "auth"].includes(error.kind)) setStatus(error); // not again: that would extend the back-off
+  if (stale.length && !blocked) {
     const names = {};
     for (const s of stale) if (meta[s] && meta[s].name) names[s] = meta[s].name;
     const res = fetchQuotes(stale, names);
-    error = res.error;
+    if (res.error && res.allFailed && ["rate", "auth"].includes(res.error.kind)) setStatus(res.error);
+    else if (!res.error && !error) setStatus(null); // requests work again: clear the watchlist's error row
+    error = error || res.error;
     quotes = loadQuotes();
   }
   const items = [];
-  if (error) items.push(errorItem(error, p));
   for (const s of symbols) {
     const q = quotes[s];
     if (q && !q.missing) items.push(quoteItem(q, t, wl.has(s), false));
     else if (q && q.missing) {
-      if (meta[s]) items.push(plainItem(s, meta[s], wl.has(s), false, "No quote available"));
+      if (meta[s]) items.push(plainItem(s, meta[s], wl.has(s), false, q.plan ? `Not available on your ${p.name} plan` : "No quote available"));
     } else if (meta[s]) items.push(plainItem(s, meta[s], wl.has(s), false, [meta[s].exchange, meta[s].type, "⇥ to load the quote"].filter(Boolean).join(" · ")));
   }
+  if (error) {
+    // below the quotes when some came through (a failed search with a typed ticker), else on top
+    const quoted = symbols.some((s) => quotes[s] && !quotes[s].missing);
+    if (quoted) items.push(errorItem(error, p));
+    else items.unshift(errorItem(error, p));
+  }
   if (!items.length) {
-    if (typedIsSymbol && quotes[typed] && quotes[typed].missing)
+    if (typedIsSymbol && quotes[typed] && quotes[typed].plan)
+      items.push(info(`No data for ${typed}`, `Not available on your ${p.name} plan`, "search"));
+    else if (typedIsSymbol && quotes[typed] && quotes[typed].missing)
       items.push(info(`No data for ${typed}`, `${p.name} has no quote for this symbol: it may be delisted or misspelt`, "search"));
     else items.push(info(`No results for “${oneLine(query, 40)}”`, "Try a ticker such as AAPL, BTC-USD or EURUSD=X", "search"));
   }
@@ -994,15 +1181,23 @@ function settingsItems(query) {
   const [cmd, ...rest] = query.slice(1).split(/\s+/);
   const argText = rest.join(" ").trim();
   if (cmd === "key" && p.needsKey) {
+    // The key travels to the action in a variable (the environment), never as the argument,
+    // which the action script would receive on its command line (visible in `ps`)
+    const saveItem = (key, title) => {
+      const t = `${title} …${key.slice(-4)}`;
+      return actionItem(t, "↩ Store it in your macOS Keychain", "savekey", "savekey", "key", { variables: { stocks_action: "savekey", stocks_key: key }, text: { copy: t, largetype: t } });
+    };
     if (argText) {
       if (!validKey(argText)) return { items: [info("That doesn’t look like an API key", "Paste the key exactly as shown on the provider’s site", "error")] };
-      const shown = argText.length > 10 ? `${argText.slice(0, 4)}…${argText.slice(-4)}` : "…";
-      return { items: [actionItem(`Save ${p.name} API key ${shown}`, "↩ Store it in your macOS Keychain", "savekey", argText, "key")] };
+      return { items: [saveItem(argText, `Save ${p.name} API key`)] };
     }
-    const items = [
+    const items = [];
+    const clip = clipboardText();
+    if (validKey(clip)) items.push(saveItem(clip, `Save the ${p.name} API key from the clipboard`));
+    items.push(
       info(`Paste your ${p.name} API key after “:key ”`, "It is stored in your macOS Keychain, never in the workflow’s files", "key"),
       actionItem(`Get a free ${p.name} API key`, p.keyURL, "open", p.keyURL, "search"),
-    ];
+    );
     if (getKey(p)) items.push(actionItem(`Remove the saved ${p.name} API key`, "↩ Delete it from the Keychain", "delkey", p.id, "error"));
     return { items };
   }
@@ -1033,11 +1228,13 @@ function filter(query) {
 
 function refresh(symbols) {
   $.setsid(); // leave Alfred's process group so a new keystroke doesn't kill the refresh
-  writeFile(lockPath(), JSON.stringify({ started: now(), symbols, pid: $.NSProcessInfo.processInfo.processIdentifier }));
+  const pid = $.NSProcessInfo.processInfo.processIdentifier;
+  writeFile(lockPath(), JSON.stringify({ started: now(), symbols, pid }));
   try {
-    fetchQuotes(cleanSymbols(symbols));
+    refreshQuotes(cleanSymbols(symbols));
   } finally {
-    removeFile(lockPath());
+    const l = readJSON(lockPath(), null);
+    if (!l || l.pid === pid) removeFile(lockPath()); // never another refresh's lock
   }
   return "";
 }
@@ -1063,39 +1260,43 @@ function act(arg) {
     case "top": {
       const sym = arg.trim().toUpperCase();
       if (!SYMBOL_RE.test(sym)) return "Not a valid symbol";
-      const list = loadWatchlist().symbols;
-      let msg, next;
-      if (action === "top") {
-        next = [sym, ...list.filter((s) => s !== sym)];
-        msg = `Moved ${sym} to the top of the watchlist`;
-      } else if (list.includes(sym)) {
-        next = list.filter((s) => s !== sym);
-        msg = `Removed ${sym} from the watchlist`;
-      } else if (list.length >= MAX_WATCHLIST) {
-        return `The watchlist is full (${MAX_WATCHLIST} symbols)`;
-      } else {
-        next = [...list, sym];
-        msg = `Added ${sym} to the watchlist`;
-      }
-      if (!saveWatchlist(next)) return "Could not save the watchlist";
-      if (env("stocks_reopen", "0") === "1" && !test) reopen();
+      const [ok, msg] = withWatchlistLock(() => {
+        const list = loadWatchlist().symbols;
+        let next;
+        if (action === "top") {
+          next = [sym, ...list.filter((s) => s !== sym)];
+          if (!saveWatchlist(next)) return [false, "Could not save the watchlist"];
+          return [true, `Moved ${sym} to the top of the watchlist`];
+        }
+        if (list.includes(sym)) {
+          next = list.filter((s) => s !== sym);
+          return saveWatchlist(next) ? [true, `Removed ${sym} from the watchlist`] : [false, "Could not save the watchlist"];
+        }
+        if (list.length >= MAX_WATCHLIST) return [false, `The watchlist is full (${MAX_WATCHLIST} symbols)`];
+        return saveWatchlist([...list, sym]) ? [true, `Added ${sym} to the watchlist`] : [false, "Could not save the watchlist"];
+      });
+      if (ok && env("stocks_reopen", "0") === "1" && !test) reopen();
       return msg;
     }
     case "restore":
-      return saveWatchlist(arg === "-" ? [] : arg.split(/\s+/)) ? "Watchlist repaired" : "Could not save the watchlist";
+      return withWatchlistLock(() => saveWatchlist(arg === "-" ? [] : arg.split(/\s+/))) ? "Watchlist repaired" : "Could not save the watchlist";
     case "reset": {
-      if (exists(watchlistPath())) FM.copyItemAtPathToPathError(watchlistPath(), `${watchlistPath()}.backup-${Math.round(Date.now() / 1000)}`, $());
-      return saveWatchlist(defaultWatchlist()) ? "Watchlist reset" : "Could not save the watchlist";
+      return withWatchlistLock(() => {
+        if (exists(watchlistPath())) FM.copyItemAtPathToPathError(watchlistPath(), `${watchlistPath()}.backup-${Math.round(Date.now() / 1000)}`, $());
+        return saveWatchlist(defaultWatchlist());
+      }) ? "Watchlist reset" : "Could not save the watchlist";
     }
     case "clearcache":
-      for (const f of [quotesPath(), searchPath(), statusPath()]) removeFile(f);
+      for (const f of [quotesPath(), searchPath(), statusPath(), lastRefreshPath()]) removeFile(f);
       FM.removeItemAtPathError(`${cacheDir()}/spark`, $());
       return "Cleared cached quotes";
-    case "savekey":
-      if (!p.needsKey || !validKey(arg)) return "Not saved: invalid API key";
-      if (!setKey(p, arg)) return "Could not save the key to the Keychain";
+    case "savekey": {
+      const key = env("stocks_key", "").trim(); // from the Script Filter's variables, never argv
+      if (!p.needsKey || !validKey(key)) return "Not saved: invalid API key";
+      if (!setKey(p, key)) return "Could not save the key to the Keychain";
       removeFile(statusPath());
       return `Saved the ${p.name} API key`;
+    }
     case "delkey":
       return deleteKey(p) ? `Removed the ${p.name} API key` : "No API key to remove";
     case "config":
@@ -1105,12 +1306,17 @@ function act(arg) {
   return "";
 }
 
+// Alfred rejects the whole JSON when a string holds an unpaired surrogate (from "&#xD800;" or a bad API)
+function wellFormed(k, v) {
+  return typeof v === "string" ? v.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, (m) => (m.length === 2 ? m : "\uFFFD")) : v;
+}
+
 function run(argv) {
   const [cmd, ...rest] = argv;
   try {
     switch (cmd) {
       case "filter":
-        return JSON.stringify(Object.assign({ skipknowledge: true }, filter(rest.join(" "))));
+        return JSON.stringify(Object.assign({ skipknowledge: true }, filter(rest.join(" "))), wellFormed);
       case "refresh":
         return refresh(rest);
       case "act":
@@ -1124,6 +1330,6 @@ function run(argv) {
     return "";
   } catch (e) {
     if (cmd !== "filter") return `Error: ${redact(e.message)}`;
-    return JSON.stringify({ items: [info("Something went wrong", redact(e.message), "error")] });
+    return JSON.stringify({ items: [info("Something went wrong", oneLine(redact(e.message), 200), "error")] }, wellFormed);
   }
 }

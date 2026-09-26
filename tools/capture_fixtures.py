@@ -41,7 +41,7 @@ for q in ["apple", "btc", "eurusd", "nestlé", "société générale", "societe 
     save("yahoo", "search_" + safe(q.lower()),
          f"{Y}/v1/finance/search?q={urllib.parse.quote(q)}&quotesCount=8&newsCount=0&listsCount=0")
 for s in ["AAPL", "^GSPC", "^IXIC", "BTC-USD", "EURUSD=X", "SHIB-USD", "BRK-A", "7203.T", "NESN.SW",
-          "TSLA", "APLE", "AAPL.TO", "TWTR"]:
+          "TSLA", "APLE", "AAPL.TO", "TWTR", "BRK-B"]:
     save("yahoo", "chart_" + safe(s), f"{Y}/v8/finance/chart/{urllib.parse.quote(s, safe='')}?range=1d&interval=5m")
 
 AV = "https://www.alphavantage.co/query"
