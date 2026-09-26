@@ -191,7 +191,7 @@ class SearchTests(Base):
         it = self.env.items("apple")
         aapl = it[0]
         self.assertEqual(aapl["title"], "AAPL   341.07 USD   ▲ +5.15 (+1.53%)")
-        self.assertEqual(aapl["subtitle"], "Apple Inc. · NasdaqGS · Day 334.53 – 341.67 · Closed")
+        self.assertEqual(aapl["subtitle"], "★ Apple Inc. · NasdaqGS · Day 334.53 – 341.67 · Closed")  # ★: in the watchlist
         self.assertEqual(aapl["arg"], "https://finance.yahoo.com/quote/AAPL/")
         self.assertTrue(aapl["icon"]["path"].startswith(os.path.join(self.env.cache, "spark", "AAPL-")), aapl["icon"])
         self.assertEqual(aapl["mods"]["cmd"]["arg"], "341.07")
@@ -533,7 +533,7 @@ class KeyedProviderTests(Base):
         self.env.set_key("finnhub")
         it = self.env.items("apple", provider="finnhub")
         self.assertEqual(it[0]["title"], "AAPL   341.07 USD   ▲ +5.15 (+1.53%)")
-        self.assertEqual(it[0]["subtitle"], "APPLE INC · Day 334.53 – 341.67 · Closed")
+        self.assertEqual(it[0]["subtitle"], "★ APPLE INC · Day 334.53 – 341.67 · Closed")
         self.assertEqual(it[0]["icon"]["path"], "icons/up.png")
         self.assertEqual(find(it, "APLE")["subtitle"], "No quote available")  # all-zero quote = unknown
         for path, headers in Mock.requests:
@@ -558,7 +558,7 @@ class KeyedProviderTests(Base):
         self.env.set_key("twelvedata")
         it = self.env.items("AAPL", provider="twelvedata")
         self.assertEqual(it[0]["title"], "AAPL   341.07 USD   ▲ +5.15 (+1.53%)")
-        self.assertEqual(it[0]["subtitle"], "Apple Inc. · NASDAQ · Day 334.53 – 341.67 · Closed")
+        self.assertEqual(it[0]["subtitle"], "★ Apple Inc. · NASDAQ · Day 334.53 – 341.67 · Closed")
         self.assertTrue(all(h.get("Authorization") == f"apikey {KEY}" for _, h in Mock.requests))
         self.assertTrue(all(KEY not in p for p, _ in Mock.requests))
         Mock.overrides["twelvedata/quote_AAPL"] = fixture("twelvedata/ratelimit")
@@ -777,7 +777,7 @@ class Audit2RegressionTests(Base):
         Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps(body).encode())
         sub = self.env.items("AAPL")[0]["subtitle"]
         sub.encode("utf-8")  # raises on a lone surrogate
-        self.assertTrue(sub.startswith("A" * 48 + "🚀…"), sub)
+        self.assertTrue(sub.startswith("★ " + "A" * 48 + "🚀…"), sub)
 
     def test_html_entities_in_names(self):
         Mock.overrides["yahoo/search_procter"] = (200, json.dumps({"quotes": [
@@ -1051,7 +1051,7 @@ class FinalReviewRegressionTests(Base):
         body["chart"]["result"][0]["meta"]["longName"] = "Evil\u202eCorp\u0007 Inc\u2066."
         Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps(body).encode())
         it = self.env.items("AAPL")
-        self.assertTrue(it[0]["subtitle"].startswith("EvilCorp  Inc."), it[0]["subtitle"])
+        self.assertTrue(it[0]["subtitle"].startswith("★ EvilCorp  Inc."), it[0]["subtitle"])
         it = self.env.items("zz\u202ezz\u0001")
         raw = json.dumps(it, ensure_ascii=False)
         self.assertNotIn("\u202e", raw)
@@ -1106,6 +1106,182 @@ class FinalReviewRegressionTests(Base):
 
     def test_unknown_provider_value(self):
         self.assertTrue(self.env.items(provider="constructor")[0]["title"].startswith("^GSPC"))
+
+
+class Round4Tests(Base):
+    """Alfred's real runtime (no LANG, macOS region settings) and the v1.1 additions."""
+
+    def fmt(self, *vals, locale="", tz="America/New_York"):
+        out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "fmt", *vals], cwd=SRC,
+                             env=dict(self.env.vars(number_locale=locale), TZ=tz), capture_output=True, text=True)
+        return json.loads(out.stdout)
+
+    def test_macos_style_locale_identifiers(self):
+        # the format macOS itself shows (de_DE, en_US@rg=dezzzz) used to be ignored silently
+        self.assertEqual(self.fmt("7743.41,2", locale="de_DE"), ["7.743,41"])
+        self.assertEqual(self.fmt("7743.41,2", locale="en_US@rg=dezzzz"), ["7.743,41"])
+        self.assertEqual(self.fmt("7743.41,2", locale="de-DE"), ["7.743,41"])
+        self.assertEqual(self.fmt("7743.41,2", locale="xx_YY"), self.fmt("7743.41,2", locale="en-US"))
+
+    def test_system_region_and_custom_separators(self):
+        # NSArgumentDomain stands in for the user's defaults (-AppleLocale, -AppleICUNumberSymbols)
+        self.assertEqual(self.fmt("1234567.891,2", "-AppleLocale", "de_DE"), ["1.234.567,89"])
+        self.assertEqual(self.fmt("1234567.891,2", "-AppleLocale", "en_US@rg=dezzzz"), ["1.234.567,89"])
+        self.assertEqual(self.fmt("1234567.891,2", "-AppleLocale", "en_IN"), ["12,34,567.89"])
+        # System Settings › Number format: English (US) region with 1.234,56
+        self.assertEqual(self.fmt("1234567.891,2", "-AppleLocale", "en_US", "-AppleICUNumberSymbols", '{ 0 = ","; 1 = "."; }'), ["1.234.567,89"])
+        # an explicit locale in the Workflow's Configuration wins over the system's symbols
+        self.assertEqual(self.fmt("1234567.891,2", "-AppleICUNumberSymbols", '{ 0 = ","; 1 = "."; }', locale="en-US"), ["1,234,567.89"])
+        # Arabic region with Western digits
+        self.assertEqual(self.fmt("1234.5,2", "-AppleLocale", "ar_SA@numbers=latn")[0][-4:], "4.50")
+
+    def test_system_time_format(self):
+        self.assertEqual(self.fmt("t:%d" % AAPL_POST, "-AppleLocale", "de_DE"), ["17:00"])
+        self.assertEqual(self.fmt("t:%d" % AAPL_POST, "-AppleLocale", "en_US")[0].replace("\u202f", " "), "5:00 PM")
+        self.assertIn("21:33", self.fmt("t:1790300000", "-AppleLocale", "en_GB")[0])
+
+    def test_alfred_runtime_fresh_install(self):
+        """env -i (no LANG, no Homebrew), Alfred's variables, paths with spaces, no data/cache folders yet."""
+        with open(os.path.join(SRC, "info.plist"), "rb") as f:
+            plist = plistlib.load(f)
+        script = [o["config"]["script"] for o in plist["objects"] if o["type"].endswith("scriptfilter")][0]
+        home = os.path.join(self.env.dir, "home dir")
+        bid = "io.github.x-o-r-r-o.stocks"
+        data = os.path.join(home, "Library/Application Support/Alfred/Workflow Data", bid)
+        cache = os.path.join(home, "Library/Caches/com.runningwithcrayons.Alfred/Workflow Data", bid)
+        wf = os.path.join(home, "Alfred.alfredpreferences/workflows/user.workflow.A B")
+        shutil.copytree(SRC, wf)
+        env = dict(HOME=home, USER=os.environ.get("USER", ""), TMPDIR=os.environ.get("TMPDIR", "/tmp"), PATH="/usr/bin:/bin:/usr/sbin:/sbin",
+                   alfred_workflow_data=data, alfred_workflow_cache=cache, alfred_preferences=os.path.dirname(os.path.dirname(wf)),
+                   alfred_version="5.6", alfred_version_build="2300", alfred_theme_subtext="3", alfred_workflow_bundleid=bid,
+                   alfred_workflow_name="Stocks", alfred_workflow_uid="user.workflow.A B", alfred_workflow_version="1.0.0", alfred_debug="1",
+                   keyword_stock="stock", provider="yahoo", open_in="yahoo", number_locale="", sparklines="1",
+                   STOCKS_YAHOO_URL=BASE, STOCKS_TEST_NOW=str(NOW), STOCKS_SYNC="1")
+        for q in (None, "apple", "Société Générale", ":"):
+            out = subprocess.run(["/bin/bash", "-c", script, "bash"] + ([q] if q else []), cwd=wf, env=env,
+                                 capture_output=True, text=True, timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            data_ = json.loads(out.stdout)
+            validate(data_)
+            self.assertNotEqual(data_["items"][0]["title"], "Something went wrong", data_)
+        self.assertTrue(os.path.exists(os.path.join(cache, "quotes.json")))
+        self.assertTrue(any(f.startswith("AAPL-") for f in os.listdir(os.path.join(cache, "spark"))))
+
+    def post_market_chart(self, pre=False):
+        body = json.loads(fixture("yahoo/chart_AAPL")[1])
+        r = body["chart"]["result"][0]
+        q = r["indicators"]["quote"][0]
+        if pre:  # before the open: only pre-market trades so far
+            r["timestamp"] = [1790324000, 1790326000, 1790329000]
+            for k in q:
+                q[k] = [341.5, 341.8, 342.0]
+        else:  # after the close: the series goes on into the post-market session
+            r["timestamp"] = r["timestamp"][:-1] + [1790366700, 1790370000, 1790380500]
+            for k in q:
+                q[k] = q[k][:-1] + [341.2, 341.3, 341.46]
+        Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps(body).encode())
+
+    def test_extended_hours_price(self):
+        self.env.items("AAPL")
+        self.assertTrue(any("includePrePost=true" in p for p, _ in Mock.requests if "/chart/" in p))
+        self.assertNotIn("after hours", self.env.items("AAPL")[0]["subtitle"].lower())  # plain fixture: no extended trades
+        self.post_market_chart()
+        env = Env()
+        it = env.items("AAPL")[0]  # Saturday: closed, Friday's after-hours price still the latest
+        self.assertEqual(it["title"], "AAPL   341.07 USD   ▲ +5.15 (+1.53%)")
+        self.assertTrue(it["subtitle"].endswith("Closed · after hours 341.46 (+0.11%)"), it["subtitle"])
+        self.assertIn("After hours 341.46 (+0.11%)", it["text"]["largetype"])
+        self.assertEqual(it["mods"]["shift"]["arg"], "AAPL 341.07 USD ▲ +5.15 (+1.53%) · after hours 341.46 (+0.11%)")
+        env = Env()
+        it = env.items("AAPL", STOCKS_TEST_NOW=AAPL_POST)[0]
+        self.assertTrue(it["subtitle"].endswith("After hours 341.46 (+0.11%)"), it["subtitle"])
+        env = Env()
+        self.assertTrue(env.items("AAPL", STOCKS_TEST_NOW=AAPL_REGULAR)[0]["subtitle"].endswith("Market open"))
+        # the day range and sparkline stay on regular hours
+        self.assertIn("Day 334.53 – 341.67", it["subtitle"])
+        self.post_market_chart(pre=True)
+        env = Env()
+        it = env.items("AAPL", STOCKS_TEST_NOW=AAPL_PRE)[0]
+        self.assertTrue(it["subtitle"].endswith("Pre-market 342.00 (+0.27%)"), it["subtitle"])
+
+    def test_cached_quote_from_v1_0_0(self):
+        # v1.0.0 cache entries have no extended-hours field
+        self.env.items("AAPL")
+        qs = self.env.quotes()
+        self.assertNotIn("ext", {k for v in qs.values() for k in v if v.get("ext")})
+        qs["AAPL"].pop("ext", None)
+        with open(os.path.join(self.env.cache, "quotes.json"), "w") as f:
+            json.dump(qs, f)
+        self.assertTrue(self.env.items("AAPL")[0]["title"].startswith("AAPL   341.07"))
+        qs["AAPL"]["ext"] = "garbage"
+        with open(os.path.join(self.env.cache, "quotes.json"), "w") as f:
+            json.dump(qs, f)
+        self.assertTrue(self.env.items("AAPL")[0]["subtitle"].endswith("Closed"))
+
+    def test_crypto_has_no_extended_hours(self):
+        self.assertNotIn("after hours", self.env.items("BTC-USD")[0]["subtitle"].lower())
+
+    def test_shift_copies_a_summary(self):
+        it = self.env.items("tesla")[0]
+        self.assertEqual(it["mods"]["shift"]["arg"], "TSLA 372.11 USD ▼ -5.83 (-1.54%)")
+        self.assertIs(it["mods"]["shift"]["valid"], True)
+        fut = find(self.env.items("apple"), "SAAPL=F")
+        self.assertEqual(fut["mods"]["shift"]["arg"], "SAAPL=F")
+        for row in self.env.items(":"):
+            if "mods" in row:
+                self.assertIs(row["mods"]["shift"]["valid"], False)
+        with open(os.path.join(SRC, "info.plist"), "rb") as f:
+            plist = plistlib.load(f)
+        uid = {o["uid"]: o["type"] for o in plist["objects"]}
+        sf = [o["uid"] for o in plist["objects"] if o["type"].endswith("scriptfilter")][0]
+        mods = {c["modifiers"] for c in plist["connections"][sf] if uid[c["destinationuid"]].endswith("clipboard")}
+        self.assertEqual(mods, {1048576, 131072})  # ⌘ and ⇧
+
+    def test_silent_actions_print_nothing(self):
+        # the Notification object ("only show if populated") would pop up empty after ↩ on a quote
+        for action, arg in (("open", "https://finance.yahoo.com/quote/AAPL/"), ("config", "config"), ("nosuchaction", "x"), ("open", "javascript:alert(1)")):
+            out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "act", arg], cwd=SRC,
+                                 env=self.env.vars(stocks_action=action, STOCKS_TEST_NOOPEN="silent"), capture_output=True, text=True, timeout=30)
+            self.assertEqual(out.stdout, "", (action, out.stdout))
+        self.assertEqual(self.env.act("toggle", "MSFT"), "Added MSFT to the watchlist")
+
+    def test_killed_runs_leave_no_damage(self):
+        # queuemode 2: Alfred terminates the previous run on every keystroke, at any point
+        import signal
+        self.env.set_key("finnhub")
+        cmd = ["osascript", "-l", "JavaScript", "./stocks.js", "filter"]
+        for i, delay in enumerate((0.05, 0.15, 0.3, 0.5, 0.8, 1.2, 2.0)):
+            Mock.fault = "slow" if i % 2 else None
+            prov = "finnhub" if i % 3 == 0 else "yahoo"
+            proc = subprocess.Popen(cmd + [["apple", "", "tesla", "AAPL"][i % 4]], cwd=SRC, env=self.env.vars(provider=prov),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(delay)
+            proc.send_signal(signal.SIGKILL)
+            proc.wait()
+        Mock.fault = None
+        for d in (self.env.cache, self.env.data):
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.endswith(".json"):
+                        json.loads(read(os.path.join(root, f)))  # never partial
+        # a lock left by a killed process doesn't hold up the next run
+        dead = subprocess.Popen(["/usr/bin/true"])
+        dead.wait()
+        lock = os.path.join(self.env.cache, "requests.lock")
+        os.makedirs(lock, exist_ok=True)
+        with open(os.path.join(lock, "pid"), "w") as f:
+            f.write(str(dead.pid))
+        t = time.time()
+        it = self.env.items("AAPL", provider="finnhub")
+        self.assertLess(time.time() - t, 2.5)
+        self.assertTrue(it[0]["title"].startswith("AAPL"), it[0])
+        self.assertFalse(os.path.exists(lock))
+        self.assertTrue(self.env.items("tesla")[0]["title"].startswith("TSLA"))
+
+    def test_star_marks_watchlist_items_in_search_only(self):
+        self.assertTrue(self.env.items("apple")[0]["subtitle"].startswith("★ "))
+        self.assertFalse(find(self.env.items("apple"), "APLE")["subtitle"].startswith("★"))
+        self.assertFalse(any(i["subtitle"].startswith("★") for i in self.env.items("")))
 
 
 @unittest.skipUnless(os.environ.get("STOCKS_KEYCHAIN") == "1", "set STOCKS_KEYCHAIN=1 to test the real Keychain (a throwaway item)")

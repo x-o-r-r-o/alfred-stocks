@@ -35,6 +35,25 @@ Raycast demand this workflow replaces (downloads, 2026-09-26):
 - Alfred passes the typed query to the Script Filter's bash as an argument, so a key typed after `:key` is visible in `ps` for a few milliseconds (bash then `exec`s osascript with the query in the environment). Saving the key from the clipboard avoids it.
 - NYSE holidays are listed for 2026–2027 (only used by Finnhub and Alpha Vantage quotes; later years fall back to weekdays).
 
+## Round 4 audit (post-release, 2026-09-27)
+- [x] Alfred runtime (`env -i`, no LANG, spaced Alfred paths, fresh install): Script Filter and actions work; numbers and times come from NSLocale, not LANG, so they match the Mac's region
+- [x] Number format: macOS-style identifiers (`de_DE`, `en_US@rg=dezzzz`) in the Workflow's Configuration were silently ignored; now accepted
+- [x] Custom separators (Language & Region › Number format) and `@numbers=latn` are honoured when no locale is configured; "as of" times use NSDateFormatter (12/24-hour setting)
+- [x] Script Filter `queuemode` 2 (terminate the previous run, as Alfred's own network workflows do) instead of 1 (wait, so a slow request held up the next keystroke). Every write is atomic; the `mkdir` locks and the refresh lock carry the owner's pid, so a killed run's lock is taken over at once (was: up to 3 s wait, or 30 s of "Loading…")
+- [x] Actions print nothing on success (JXA `return ""` printed a newline: a possible empty notification after ↩)
+- [x] v1.1: after-hours / pre-market price (Yahoo Finance, `includePrePost`), ⇧↩ copies a summary line, ★ marks search results already in the watchlist
+
+## Ideas for v1.1
+Ranked by value for effort (sources: raycast/extensions issues and changelogs for Stock Tracker and Stock Lookup, 2023–2026):
+1. Several named watchlists (raycast/extensions#7200), e.g. `:list crypto`.
+2. 52-week range in Large Type and Quick Look (Yahoo sends `fiftyTwoWeekHigh`/`Low` already).
+3. Pence-quoted markets (`GBp`, `ZAc`, `ILA`): show "72.50p" or convert to pounds (Stock Tracker fixed the same in 2026-06).
+4. "Move up / down" in the watchlist (⌃↩ only moves to the top).
+5. Portfolio: holdings and day gain per row.
+6. Price alerts via a background check (needs a scheduler; Alfred has none, so only on keyword use).
+7. A Hotkey that shows the watchlist, and a Snippet-style `{stock:AAPL}` via an external trigger.
+8. Market-cap / volume in the subtitle for search results (costs width; maybe ⌘ subtitle).
+
 ## Verify in real Alfred before release
 - `:config` reveals the workflow in Alfred Preferences (AppleScript `reveal workflow`); check it lands on the workflow and the Configure button is obvious.
 - ⌥↩ / ⌃↩ in the watchlist reopen Alfred on the watchlist (AppleScript `search`); the first run may ask for Automation permission.

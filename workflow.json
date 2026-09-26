@@ -54,7 +54,7 @@
       "type": "textfield",
       "variable": "number_locale",
       "label": "Number format",
-      "description": "A locale such as en-US, de-DE or fr-CH. Leave empty to use the system’s format.",
+      "description": "A locale such as en-US, de-DE or fr_CH. Leave empty to follow the Mac’s Language & Region settings.",
       "config": {
         "default": "",
         "placeholder": "System",
@@ -83,6 +83,7 @@
       "subtext": "Your watchlist, or type a ticker or company",
       "script": "stocks_query=\"$1\" exec osascript -l JavaScript ./stocks.js filter",
       "queuedelaymode": 1,
+      "queuemode": 2,
       "running": "Fetching quotes…"
     },
     {
@@ -113,6 +114,7 @@
     { "from": "sf_stock", "to": "act", "mod": "alt" },
     { "from": "sf_stock", "to": "act", "mod": "ctrl" },
     { "from": "sf_stock", "to": "copy", "mod": "cmd" },
+    { "from": "sf_stock", "to": "copy", "mod": "shift" },
     { "from": "act", "to": "notify" }
   ]
 }

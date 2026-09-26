@@ -304,7 +304,8 @@ const PROVIDERS = {
         .map((x) => ({ symbol: x.symbol.toUpperCase(), name: name(x.longname) || name(x.shortname), exchange: str(x.exchDisp) || str(x.exchange), type: str(x.typeDisp) || str(x.quoteType) }));
     },
     quoteReq(sym) {
-      return { url: `${this.base()}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`, ua: YAHOO_UA };
+      // includePrePost: the series also covers pre-market and after-hours trading (the extended-hours price)
+      return { url: `${this.base()}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m&includePrePost=true`, ua: YAHOO_UA };
     },
     parseQuote(sym, v) {
       const c = v.chart;
@@ -319,9 +320,24 @@ const PROVIDERS = {
       const price = num(m.regularMarketPrice);
       if (price === null) return null;
       const q0 = (((r.indicators || {}).quote || [])[0] || {});
-      const series = (Array.isArray(q0.close) ? q0.close : []).map(num).filter((x) => x !== null);
+      const closes = Array.isArray(q0.close) ? q0.close : [];
+      const stamps = Array.isArray(r.timestamp) && r.timestamp.length === closes.length ? r.timestamp.map(num) : null;
+      const pts = closes.map((c, i) => ({ t: stamps ? stamps[i] : null, v: num(c) })).filter((x) => x.v !== null);
       const p = m.currentTradingPeriod;
       const period = (x) => (x && num(x.start) !== null && num(x.end) !== null ? { start: num(x.start), end: num(x.end) } : null);
+      const reg = p && typeof p === "object" ? period(p.regular) : null;
+      const h24 = str(m.instrumentType) === "CRYPTOCURRENCY";
+      // the sparkline and day range cover regular hours; the last trade outside them is the extended-hours price
+      let series = pts.map((x) => x.v), ext = null;
+      if (reg && stamps && !h24) {
+        // without extended hours Yahoo ends the series with the closing print, stamped at the session's end
+        const last = pts[pts.length - 1];
+        const lastIsClose = last && last.t === reg.end && (pts.length < 2 || pts[pts.length - 2].t < reg.end);
+        const inReg = pts.filter((x) => x.t !== null && x.t >= reg.start && (x.t < reg.end || (x === last && lastIsClose))).map((x) => x.v);
+        if (inReg.length >= 2) series = inReg;
+        const kind = last && last.t !== null && !lastIsClose ? (last.t >= reg.end ? "post" : last.t < reg.start ? "pre" : null) : null;
+        if (kind && last.v > 0 && last.v !== price) ext = { price: last.v, time: last.t, kind };
+      }
       return {
         symbol: sym,
         name: name(m.longName) || name(m.shortName),
@@ -336,7 +352,8 @@ const PROVIDERS = {
         hint: num(m.priceHint),
         time: num(m.regularMarketTime),
         periods: p && typeof p === "object" ? { pre: period(p.pre), regular: period(p.regular), post: period(p.post) } : null,
-        h24: str(m.instrumentType) === "CRYPTOCURRENCY",
+        h24,
+        ext,
         series,
       };
     },
@@ -562,32 +579,56 @@ function validKey(k) {
 
 // The system's formatting locale. Formats follow the region, which may differ from the language's:
 // "en_US@rg=dezzzz" (English, region Germany) formats as en-DE (1.234,5), not en-US.
-function systemLocale() {
-  const l = $.NSLocale.currentLocale;
+// A BCP 47 tag for an NSLocale; "@numbers=latn" (e.g. Arabic with Western digits) becomes -u-nu-latn.
+// Alfred runs scripts without LANG/LC_*, so the region always comes from NSLocale (the user's defaults).
+function localeTag(l) {
   const part = (k) => {
     const v = l.objectForKey(k);
     return v.isNil() ? "" : v.js;
   };
-  const tag = [part($.NSLocaleLanguageCode), part($.NSLocaleScriptCode), part($.NSLocaleCountryCode)].filter(Boolean).join("-");
-  return tag || l.localeIdentifier.js.split("@")[0].replace(/_/g, "-");
+  const id = l.localeIdentifier.js;
+  let tag = [part($.NSLocaleLanguageCode), part($.NSLocaleScriptCode), part($.NSLocaleCountryCode)].filter(Boolean).join("-");
+  tag = tag || id.split("@")[0].replace(/_/g, "-");
+  const nu = id.match(/[@;]numbers=([a-z]{3,8})\b/i);
+  return nu && tag ? `${tag}-u-nu-${nu[1].toLowerCase()}` : tag;
+}
+function supported(tag) {
+  try {
+    return !!tag && Intl.NumberFormat.supportedLocalesOf([tag]).length > 0;
+  } catch (e) {
+    return false; // invalid tag
+  }
 }
 
-const LOCALE = (() => {
-  for (const cand of [env("number_locale", "").trim(), systemLocale(), "en-US"]) {
-    if (!cand) continue;
-    try {
-      if (Intl.NumberFormat.supportedLocalesOf([cand]).length) return cand;
-    } catch (e) {
-      /* invalid tag */
-    }
-  }
-  return "en-US";
+// {tag, system}: the Workflow Configuration's locale (en-US, or macOS style de_DE / en_US@rg=dezzzz),
+// else the system's
+const LOC = (() => {
+  let own = env("number_locale", "").trim();
+  if (/[_@]/.test(own)) own = localeTag($.NSLocale.localeWithLocaleIdentifier(own));
+  if (supported(own)) return { tag: own, system: false };
+  const sys = localeTag($.NSLocale.currentLocale);
+  return supported(sys) ? { tag: sys, system: true } : { tag: "en-US", system: false };
+})();
+const LOCALE = LOC.tag;
+
+// With the system's format, use its separators too: System Settings › Language & Region › Number format
+// can override the region's (e.g. English (US) with 1.234,56), which only NSLocale knows about.
+const SEPS = (() => {
+  if (!LOC.system) return null;
+  const l = $.NSLocale.currentLocale;
+  const s = (v) => (v.isNil() ? "" : v.js);
+  const decimal = s(l.decimalSeparator), group = s(l.groupingSeparator);
+  return decimal && decimal !== group ? { decimal, group } : null;
 })();
 
 const NF = {};
 function nf(min, max, grouping = true) {
   const k = `${min}/${max}/${grouping}`;
-  return NF[k] || (NF[k] = new Intl.NumberFormat(LOCALE, { minimumFractionDigits: min, maximumFractionDigits: max, useGrouping: grouping }));
+  if (NF[k]) return NF[k];
+  const f = new Intl.NumberFormat(LOCALE, { minimumFractionDigits: min, maximumFractionDigits: max, useGrouping: grouping });
+  return (NF[k] = !SEPS ? f : {
+    format: (v) => f.formatToParts(v).map((p) => (p.type === "decimal" ? SEPS.decimal : p.type === "group" ? SEPS.group : p.value)).join(""),
+  });
 }
 
 // Decimal places for a price: the provider's hint, more for sub-unit prices (penny stocks, SHIB),
@@ -640,7 +681,16 @@ function fmtPct(v) {
 }
 
 function fmtTime(t, ref) {
-  const opts = ref - t > 20 * 3600 ? { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" } : { hour: "numeric", minute: "2-digit" };
+  const withDate = ref - t > 20 * 3600;
+  if (LOC.system) {
+    // NSDateFormatter honours the 24-hour time switch in System Settings, which Intl doesn't see
+    const f = $.NSDateFormatter.alloc.init;
+    f.locale = $.NSLocale.currentLocale;
+    f.localizedDateFormatFromTemplate = withDate ? "MMMdjmm" : "jmm";
+    const s = f.stringFromDate($.NSDate.dateWithTimeIntervalSince1970(t));
+    if (!s.isNil() && s.js) return s.js;
+  }
+  const opts = withDate ? { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" } : { hour: "numeric", minute: "2-digit" };
   return new Intl.DateTimeFormat(LOCALE, opts).format(new Date(t * 1000));
 }
 
@@ -767,17 +817,21 @@ function refreshRunning() {
   return typeof l.pid === "number" ? alive(l.pid) && age < REFRESH_MAX : age < LOCK_TTL;
 }
 
-// Serialise a read-modify-write across processes: mkdir is atomic. A lock left by a killed process
-// is taken over after a few seconds.
+// Serialise a read-modify-write across processes: mkdir is atomic. The owner's pid goes inside, so a
+// lock left by a killed process (Alfred terminates the previous Script Filter run on each keystroke)
+// is taken over at once; one without a pid after a few seconds.
+const PID = $.NSProcessInfo.processInfo.processIdentifier;
 function withLock(dir, fn) {
   const until = Date.now() + 3000;
   let got = false;
   while (!(got = FM.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, false, $(), $()))) {
     const age = Date.now() / 1000 - mtime(dir);
-    if (exists(dir) && (age > 10 || age < -60)) removeFile(dir);
+    const owner = Number(readFile(`${dir}/pid`));
+    if (exists(dir) && (age > 10 || age < -60 || (owner > 1 && !alive(owner)))) removeFile(dir);
     else if (Date.now() > until) break;
     else $.NSThread.sleepForTimeInterval(0.05);
   }
+  if (got) writeFile(`${dir}/pid`, String(PID));
   try {
     return fn();
   } finally {
@@ -1031,7 +1085,7 @@ function info(title, subtitle, iconName = "info", extra = {}) {
 // modifiers are disabled so ⌘↩ doesn't copy the internal arg and ⌥/⌃ don't run the action as a watchlist edit
 function actionItem(title, subtitle, action, arg, iconName, extra = {}) {
   const off = { arg: "", valid: false, subtitle };
-  return Object.assign({ title, subtitle, arg, variables: { stocks_action: action }, icon: icon(iconName), mods: { cmd: off, alt: off, ctrl: off } }, extra);
+  return Object.assign({ title, subtitle, arg, variables: { stocks_action: action }, icon: icon(iconName), mods: { cmd: off, alt: off, ctrl: off, shift: off } }, extra);
 }
 
 function errorItem(err, p) {
@@ -1060,25 +1114,31 @@ function quoteItem(q, t, inWatchlist, watchMode) {
   if (q.name && q.name.toUpperCase() !== q.symbol) parts.push(oneLine(q.name, 50));
   if (q.exchange) parts.push(q.exchange);
   if (q.low !== null && q.low !== undefined && q.high !== null && q.high !== undefined) parts.push(`Day ${fmtPrice(q.low, q.hint)} – ${fmtPrice(q.high, q.hint)}`);
-  if (state) parts.push(STATE_LABEL[state]);
+  const ext = extended(q, state);
+  if (state === "POST" && ext) parts.push(`${STATE_LABEL.POST} ${ext}`);
+  else if (state === "PRE" && ext) parts.push(`${STATE_LABEL.PRE} ${ext}`);
+  else if (state) parts.push(ext ? `${STATE_LABEL[state]} · after hours ${ext}` : STATE_LABEL[state]);
   // the last trade's time when the quote is stale or the price is from an earlier day (a weekend, a halt)
   const asOf = typeof q.time === "number" && q.time > 0 && q.time <= q.fetched + 60 ? q.time : q.fetched;
   if (t - q.fetched > ttl(q, t) * 3 || t - asOf > 20 * 3600) parts.push(`as of ${fmtTime(asOf, t)}`);
   const url = siteURL(q.symbol, q);
   const plain = fmtPrice(q.price, q.hint, false);
   const iconPath = q.spark && enabled("sparklines", true) && exists(q.spark) ? { path: q.spark } : icon(change === null || change === 0 ? "flat" : change > 0 ? "up" : "down");
-  const title = `${q.symbol}   ${price}${cur}   ${arrow}${fmtChange(change, q.price, q.hint)} (${fmtPct(pct)})`;
+  const move = `${arrow}${fmtChange(change, q.price, q.hint)} (${fmtPct(pct)})`;
+  const title = `${q.symbol}   ${price}${cur}   ${move}`;
+  const summary = `${q.symbol} ${price}${cur} ${move}${ext ? ` · ${q.ext.kind === "pre" ? "pre-market" : "after hours"} ${ext}` : ""}`;
   const item = {
     title,
-    subtitle: parts.join(" · "),
+    subtitle: star(inWatchlist, watchMode) + parts.join(" · "),
     arg: url,
     autocomplete: q.symbol,
     quicklookurl: /^https:/.test(url) ? url : `https://finance.yahoo.com/quote/${encodeURIComponent(q.symbol)}/`,
     variables: { stocks_action: "open" },
     icon: iconPath,
-    text: { copy: plain, largetype: `${q.symbol}  ${price}${cur}\n${arrow}${fmtChange(change, q.price, q.hint)} (${fmtPct(pct)})` },
+    text: { copy: plain, largetype: `${q.symbol}  ${price}${cur}\n${move}${ext ? `\n${q.ext.kind === "pre" ? "Pre-market" : "After hours"} ${ext}` : ""}` },
     mods: {
       cmd: { arg: plain, valid: true, subtitle: `Copy the price: ${plain}` },
+      shift: { arg: summary, valid: true, subtitle: `Copy “${oneLine(summary, 70)}”` },
       alt: {
         arg: q.symbol,
         valid: true,
@@ -1091,6 +1151,20 @@ function quoteItem(q, t, inWatchlist, watchMode) {
   return item;
 }
 
+// The extended-hours price with its change from the regular close ("341.46 (+0.11%)"), while it's current:
+// after hours until the next pre-market, pre-market until the open
+function extended(q, state) {
+  const e = q.ext;
+  if (!e || typeof e !== "object" || !Number.isFinite(e.price) || !Number.isFinite(q.price) || !q.price) return "";
+  if (!(e.kind === "post" ? state === "POST" || state === "CLOSED" : e.kind === "pre" && state === "PRE")) return "";
+  return `${fmtPrice(e.price, q.hint)} (${fmtPct(((e.price - q.price) / Math.abs(q.price)) * 100)})`;
+}
+
+// search results that are already in the watchlist
+function star(inWatchlist, watchMode) {
+  return inWatchlist && !watchMode ? "★ " : "";
+}
+
 // ⌃↩: move to the top of the watchlist (or add it there from a search)
 function topMod(sym, inWatchlist, watchMode) {
   return { arg: sym, valid: true, subtitle: inWatchlist ? `Move ${sym} to the top of the watchlist` : `Add ${sym} to the top of the watchlist`, variables: { stocks_action: "top", stocks_reopen: watchMode ? "1" : "0" } };
@@ -1101,7 +1175,7 @@ function plainItem(sym, meta, inWatchlist, watchMode, subtitle) {
   const url = siteURL(sym, null);
   const item = {
     title: meta && meta.name ? `${sym}   ${oneLine(meta.name, 60)}` : sym,
-    subtitle: subtitle || [meta && meta.exchange, meta && meta.type].filter(Boolean).join(" · ") || `Open in ${siteName()}`,
+    subtitle: star(inWatchlist, watchMode) + (subtitle || [meta && meta.exchange, meta && meta.type].filter(Boolean).join(" · ") || `Open in ${siteName()}`),
     arg: url,
     autocomplete: sym,
     quicklookurl: /^https:/.test(url) ? url : `https://finance.yahoo.com/quote/${encodeURIComponent(sym)}/`,
@@ -1109,6 +1183,7 @@ function plainItem(sym, meta, inWatchlist, watchMode, subtitle) {
     icon: icon("flat"),
     mods: {
       cmd: { arg: sym, valid: true, subtitle: `Copy ${sym}` },
+      shift: { arg: sym, valid: true, subtitle: `Copy ${sym}` },
       alt: {
         arg: sym,
         valid: true,
@@ -1133,7 +1208,8 @@ function startRefresh(symbols) {
     refreshQuotes(symbols);
     return false;
   }
-  writeFile(lockPath(), JSON.stringify({ started: now(), symbols }));
+  // this process's pid until the refresh's is known: if Alfred kills this run first, the lock is dead at once
+  writeFile(lockPath(), JSON.stringify({ started: now(), symbols, pid: PID }));
   const script = `${FM.currentDirectoryPath.js}/stocks.js`;
   const pid = spawn("/usr/bin/osascript", ["-l", "JavaScript", script, "refresh", ...symbols]);
   if (!pid) {
@@ -1141,7 +1217,7 @@ function startRefresh(symbols) {
     return false;
   }
   const l = readJSON(lockPath(), null); // the refresh may have written its own lock already (or finished)
-  if (l && !l.pid) writeFile(lockPath(), JSON.stringify({ started: l.started, symbols, pid }));
+  if (l && l.pid === PID) writeFile(lockPath(), JSON.stringify({ started: l.started, symbols, pid }));
   return true;
 }
 
@@ -1299,7 +1375,7 @@ function filter(query) {
 
 function refresh(symbols) {
   $.setsid(); // leave Alfred's process group so a new keystroke doesn't kill the refresh
-  const pid = $.NSProcessInfo.processInfo.processIdentifier;
+  const pid = PID;
   writeFile(lockPath(), JSON.stringify({ started: now(), symbols, pid }));
   try {
     refreshQuotes(cleanSymbols(symbols));
@@ -1313,20 +1389,21 @@ function refresh(symbols) {
 // ---------- actions ----------
 
 function reopen() {
-  const kw = env("keyword_stock", "stock");
+  const kw = env("keyword_stock", "").trim() || "stock"; // a required field can still arrive empty
   exec("/usr/bin/osascript", ["-e", "on run argv", "-e", 'tell application id "com.runningwithcrayons.Alfred" to search (item 1 of argv)', "-e", "end run", `${kw} `]);
 }
 
 function act(arg) {
   const action = env("stocks_action", "open");
   const p = provider();
-  const test = env("STOCKS_TEST_NOOPEN", "0") === "1"; // test suite only: don't launch apps
+  // test suite only: don't launch apps ("1": say what would have opened, "silent": print what Alfred would get)
+  const test = env("STOCKS_TEST_NOOPEN", "0") !== "0", report = env("STOCKS_TEST_NOOPEN", "0") === "1";
   switch (action) {
     case "open":
       const url = /^(https:\/\/|stocks:\/\/)/.test(arg) ? $.NSURL.URLWithString(arg) : null;
       if (!url || url.isNil()) return "";
       if (!test) $.NSWorkspace.sharedWorkspace.openURL(url);
-      return test ? `open ${arg}` : "";
+      return report ? `open ${arg}` : "";
     case "toggle":
     case "top": {
       const sym = arg.trim().toUpperCase();
@@ -1374,7 +1451,7 @@ function act(arg) {
       return deleteKey(p) ? `Removed the ${p.name} API key` : "No API key to remove";
     case "config":
       if (!test) exec("/usr/bin/osascript", ["-e", "on run argv", "-e", 'tell application id "com.runningwithcrayons.Alfred" to reveal workflow (item 1 of argv)', "-e", "end run", BUNDLE]);
-      return test ? "config" : "";
+      return report ? "config" : "";
   }
   return "";
 }
@@ -1397,16 +1474,18 @@ function run(argv) {
       case "filter": // the query comes in stocks_query (see workflow.json) or, for tests, as arguments
         return JSON.stringify(Object.assign({ skipknowledge: true }, filter(rest.length ? rest.join(" ") : env("stocks_query", ""))), wellFormed);
       case "refresh":
-        return refresh(rest);
-      case "act":
-        return act(rest.join(" "));
-      case "fmt": // formatting check used by the test suite: fmt <price[,hint]>…
-        return JSON.stringify(rest.map((x) => {
+        refresh(rest);
+        return undefined;
+      case "act": // "" would still print a newline, and Alfred's notification would show up empty
+        return act(rest.join(" ")) || undefined;
+      case "fmt": // formatting check used by the test suite: fmt <price[,hint] | t:epoch>… [-AppleXxx value]…
+        return JSON.stringify(rest.filter((x, i) => !/^-Apple/.test(x) && !/^-Apple/.test(rest[i - 1] || "")).map((x) => {
+          if (x.startsWith("t:")) return fmtTime(Number(x.slice(2)), now());
           const [v, h] = x.split(",");
           return fmtPrice(num(v), h === undefined || h === "" ? null : Number(h));
         }));
     }
-    return "";
+    return undefined;
   } catch (e) {
     if (cmd !== "filter") return `Error: ${redact(e.message)}`;
     return JSON.stringify({ items: [info("Something went wrong", oneLine(redact(e.message), 200), "error")] }, wellFormed);

@@ -4,11 +4,11 @@ Stock, index, crypto and currency quotes in Alfred, with a watchlist and intrada
 
 ## Usage
 
-See your watchlist via the `stock` keyword. Each row shows the price, the change since the previous close (▲ up, ▼ down), the day range and whether the market is open, with the day’s chart as its icon. Quotes appear instantly from the cache and refresh in the background.
+See your watchlist via the `stock` keyword. Each row shows the price, the change since the previous close (▲ up, ▼ down), the day range and whether the market is open (with Yahoo Finance, also the pre-market or after-hours price), with the day’s chart as its icon. Quotes appear instantly from the cache and refresh in the background.
 
 ![The watchlist with sparklines](images/watchlist.png)
 
-Look up a stock, index, cryptocurrency or currency pair by ticker or company name, like `apple`, `^GSPC`, `BTC-USD` or `EURUSD=X`, via the `stock` keyword.
+Look up a stock, index, cryptocurrency or currency pair by ticker or company name, like `apple`, `^GSPC`, `BTC-USD` or `EURUSD=X`, via the `stock` keyword. Results already in your watchlist are marked with ★.
 
 ![Searching for a company](images/search.png)
 
@@ -18,6 +18,7 @@ Alternatively, look up selected text via the Universal Action.
 
 * <kbd>↩</kbd> Open the quote in Yahoo Finance, Google Finance, TradingView or the Stocks app, as set in the Workflow’s Configuration.
 * <kbd>⌘</kbd><kbd>↩</kbd> Copy the price.
+* <kbd>⇧</kbd><kbd>↩</kbd> Copy a summary, like “AAPL 341.07 USD ▲ +5.15 (+1.53%)”.
 * <kbd>⌥</kbd><kbd>↩</kbd> Add to or remove from the watchlist.
 * <kbd>⌃</kbd><kbd>↩</kbd> Move to the top of the watchlist, or add it there.
 * <kbd>⌘</kbd><kbd>Y</kbd> Quick Look the quote page.
@@ -32,6 +33,8 @@ Reset the watchlist (`:reset`), clear cached quotes (`:cache`) or open the Workf
 Yahoo Finance is used by default and needs no account. Its API is unofficial and can change or block requests without notice (that is how the older Alfred stock workflows broke), so the workflow tells you when a provider fails. Pick Finnhub, Twelve Data or Alpha Vantage in the Workflow’s Configuration instead, then save a free API key with `:key` followed by the key, or copy the key and type `:key`, via the `stock` keyword. Keys are stored in the macOS Keychain.
 
 Symbols follow each provider’s conventions: Yahoo Finance uses `^GSPC`, `BTC-USD`, `EURUSD=X` and exchange suffixes like `7203.T`; Finnhub uses `BINANCE:BTCUSDT`; Twelve Data uses `BTC/USD` and `EUR/USD`. Sparklines are drawn for Yahoo Finance quotes only. The free plans of the keyed providers mostly cover US markets (other symbols show as not available on your plan) and have tight limits. The workflow keeps within them, so their quotes refresh less often (every 5 minutes with Twelve Data, every 3 hours with Alpha Vantage, which allows 25 requests a day) and it tells you when the limit is reached.
+
+Numbers and times follow your Mac’s Language & Region settings, or the locale set in the Workflow’s Configuration (like `de-DE` or `de_DE`).
 
 Quotes may be delayed and are for information only: this is not financial advice, and the workflow can’t trade.
 
