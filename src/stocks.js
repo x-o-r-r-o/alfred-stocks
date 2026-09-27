@@ -1103,19 +1103,40 @@ function actionItem(title, subtitle, action, arg, iconName, extra = {}) {
   return Object.assign({ title, subtitle, arg, variables: { stocks_action: action }, icon: icon(iconName), mods: { cmd: off, alt: off, ctrl: off, shift: off } }, extra);
 }
 
-function errorItem(err, p) {
+// "5 min", "3 h": how long until a rate limit lifts
+function fmtWait(sec) {
+  if (!(sec > 90)) return "a minute";
+  if (sec < 3600) return `${Math.ceil(sec / 60)} min`;
+  return `${Math.round(sec / 3600)} h`;
+}
+// "5 min ago", for the row above quotes shown from the cache while offline
+function fmtAgo(sec) {
+  const m = Math.round(sec / 60);
+  if (m < 1) return "less than a minute ago";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
+}
+const capital = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+// cachedAge: seconds since the quotes shown with this row were fetched (network errors only; null when none are shown)
+function errorItem(err, p, cachedAge = null) {
   // a missing or rejected key points to `stock apikey`, with the same wording as the other workflows
   if (err.kind === "nokey") return info(`Set your ${p.name} API key`, `Save it via “${keyCommand()}”`, "key", { autocomplete: "apikey " });
   if (err.kind === "auth" && p.needsKey) return info(`${p.name} rejected your API key`, `Save a new one via “${keyCommand()}”`, "error", { autocomplete: "apikey " });
-  const hints = {
-    auth: "The provider blocked the request. ↩ Pick another provider in the Workflow’s Configuration",
-    rate: "Wait a little, or ↩ pick another provider in the Workflow’s Configuration",
-    network: "Check your internet connection",
-  };
-  const sub = hints[err.kind] || "The service may have changed or be down. ↩ Pick another provider in the Workflow’s Configuration";
+  if (err.kind === "network") {
+    if (cachedAge !== null) return info(`Offline: showing results from ${fmtAgo(Math.max(0, cachedAge))}`, "Check your internet connection", "offline");
+    return info(`Can’t reach ${p.name}`, "Check your internet connection", "offline");
+  }
   const msg = oneLine(redact(err.message), 100); // provider text: may hold newlines or be long
-  const title = `${p.name}: ${msg}${err.status && !/\d{3}/.test(msg) ? ` (HTTP ${err.status})` : ""}`;
-  if (err.kind === "network") return info(title, sub, "error");
+  const pick = "↩ Pick another provider in the Workflow’s Configuration";
+  if (err.kind === "rate") {
+    const until = typeof err.until === "number" ? err.until : 0;
+    const detail = /^(rate limited|rate limit reached)$/i.test(msg) || !msg ? "" : ` · ${capital(msg)}`;
+    return actionItem(`${p.name} is limiting requests`, `Try again in ${fmtWait(until - now())}${detail} · ${pick}`, "config", "config", "error");
+  }
+  const sub = err.kind === "auth" ? `The provider blocked the request. ${pick}` : `The service may have changed or be down. ${pick}`;
+  const title = `Couldn’t get data from ${p.name}: ${msg}${err.status && !/\d{3}/.test(msg) ? ` (HTTP ${err.status})` : ""}`;
   return actionItem(title, sub, "config", "config", "error");
 }
 
@@ -1261,7 +1282,11 @@ function watchlistItems() {
   // the next batch is due once the provider's per-minute budget allows it
   const waiting = !running && !backoff && tooSoon && stale.length > 0;
   const err = lastError();
-  if (err && !running) items.push(errorItem(err, p));
+  if (err && !running) {
+    // quotes shown from the cache while offline: how old the oldest one is
+    const shown = wl.symbols.map((s) => quotes[s]).filter((q) => q && !q.missing && typeof q.fetched === "number");
+    items.push(errorItem(err, p, shown.length ? t - Math.min(...shown.map((q) => q.fetched)) : null));
+  }
   for (const s of wl.symbols) {
     const q = quotes[s];
     if (q && !q.missing) items.push(quoteItem(q, t, true, true));
@@ -1324,8 +1349,10 @@ function searchItems(query) {
   }
   if (error) {
     // below the quotes when some came through (a failed search with a typed ticker), else on top
-    const quoted = symbols.some((s) => quotes[s] && !quotes[s].missing);
-    if (quoted) items.push(errorItem(error, p));
+    const shown = symbols.map((s) => quotes[s]).filter((q) => q && !q.missing);
+    const quoted = shown.length > 0;
+    const fetched = shown.map((q) => q.fetched).filter((f) => typeof f === "number");
+    if (quoted) items.push(errorItem(error, p, fetched.length ? t - Math.min(...fetched) : null));
     else items.unshift(errorItem(error, p));
   }
   if (!items.length) {
@@ -1454,27 +1481,27 @@ function act(arg) {
         if (action === "top") {
           if (!list.includes(sym) && list.length >= MAX_WATCHLIST) return [false, `The watchlist is full (${MAX_WATCHLIST} symbols)`];
           next = [sym, ...list.filter((s) => s !== sym)];
-          if (!saveWatchlist(next)) return [false, "Could not save the watchlist"];
+          if (!saveWatchlist(next)) return [false, "Couldn’t save the watchlist"];
           return [true, list.includes(sym) ? `Moved ${sym} to the top of the watchlist` : `Added ${sym} to the top of the watchlist`];
         }
         if (list.includes(sym)) {
           next = list.filter((s) => s !== sym);
-          return saveWatchlist(next) ? [true, `Removed ${sym} from the watchlist`] : [false, "Could not save the watchlist"];
+          return saveWatchlist(next) ? [true, `Removed ${sym} from the watchlist`] : [false, "Couldn’t save the watchlist"];
         }
         if (list.length >= MAX_WATCHLIST) return [false, `The watchlist is full (${MAX_WATCHLIST} symbols)`];
-        return saveWatchlist([...list, sym]) ? [true, `Added ${sym} to the watchlist`] : [false, "Could not save the watchlist"];
+        return saveWatchlist([...list, sym]) ? [true, `Added ${sym} to the watchlist`] : [false, "Couldn’t save the watchlist"];
       });
       if (ok && env("stocks_reopen", "0") === "1" && !test) reopen();
       return msg;
     }
     case "restore":
-      return withWatchlistLock(() => saveWatchlist(arg === "-" ? [] : arg.split(/\s+/))) ? "Watchlist repaired" : "Could not save the watchlist";
+      return withWatchlistLock(() => saveWatchlist(arg === "-" ? [] : arg.split(/\s+/))) ? "Watchlist repaired" : "Couldn’t save the watchlist";
     case "reset": {
       return withWatchlistLock(() => {
         if (exists(watchlistPath())) FM.copyItemAtPathToPathError(watchlistPath(), `${watchlistPath()}.backup-${Math.round(Date.now() / 1000)}`, $());
         pruneBackups();
         return saveWatchlist(defaultWatchlist());
-      }) ? "Watchlist reset" : "Could not save the watchlist";
+      }) ? "Watchlist reset" : "Couldn’t save the watchlist";
     }
     case "clearcache":
       for (const f of [quotesPath(), searchPath(), statusPath(), lastRefreshPath()]) removeFile(f);

@@ -4,6 +4,7 @@
   "down": ["arrowtriangle.down.fill", "#DC2626"],
   "flat": ["chart.line.flattrend.xyaxis", "#64748B"],
   "error": ["exclamationmark.triangle.fill", "#DC2626"],
+  "offline": ["wifi.slash", "#D97706"],
   "info": ["info.circle.fill", "#64748B"],
   "key": ["key.horizontal.fill", "#D97706"],
   "key-remove": ["trash.fill", "#DC2626"],

@@ -454,20 +454,20 @@ class FailureTests(Base):
         return it[0]
 
     def test_http_errors(self):
-        e = self.check((403, b"Forbidden"), "Yahoo Finance: access denied (HTTP 403)")
+        e = self.check((403, b"Forbidden"), "Couldn’t get data from Yahoo Finance: access denied (HTTP 403)")
         self.assertEqual(e["variables"]["stocks_action"], "config")
         self.assertIn("Workflow’s Configuration", e["subtitle"])
-        self.check((500, b"oops"), "Yahoo Finance: server error (HTTP 500)")
-        self.check((429, b"Too Many Requests"), "Yahoo Finance: rate limited (HTTP 429)")
+        self.check((500, b"oops"), "Couldn’t get data from Yahoo Finance: server error (HTTP 500)")
+        self.check((429, b"Too Many Requests"), "Yahoo Finance is limiting requests")
         self.env = Env()  # a rate limit backs off for a minute
-        self.check((502, b"<html>bad gateway</html>"), "Yahoo Finance: server error (HTTP 502)")
+        self.check((502, b"<html>bad gateway</html>"), "Couldn’t get data from Yahoo Finance: server error (HTTP 502)")
 
     def test_malformed_and_empty(self):
-        self.check((200, b'{"quotes": [{"symbol": "AAPL"'), "Yahoo Finance: unexpected response (not JSON) (HTTP 200)")
-        self.check((200, b""), "Yahoo Finance: empty response (HTTP 200)")
-        self.check((200, b"<html>consent</html>"), "Yahoo Finance: unexpected response (not JSON) (HTTP 200)")
-        self.check((200, b"[]"), "Yahoo Finance: unexpected search response")
-        self.check((200, b"null"), "Yahoo Finance: unexpected response (HTTP 200)")
+        self.check((200, b'{"quotes": [{"symbol": "AAPL"'), "Couldn’t get data from Yahoo Finance: unexpected response (not JSON) (HTTP 200)")
+        self.check((200, b""), "Couldn’t get data from Yahoo Finance: empty response (HTTP 200)")
+        self.check((200, b"<html>consent</html>"), "Couldn’t get data from Yahoo Finance: unexpected response (not JSON) (HTTP 200)")
+        self.check((200, b"[]"), "Couldn’t get data from Yahoo Finance: unexpected search response")
+        self.check((200, b"null"), "Couldn’t get data from Yahoo Finance: unexpected response (HTTP 200)")
 
     def test_changed_quote_shape(self):
         Mock.overrides["yahoo/chart_AAPL"] = (200, b'{"chart": {"result": [{"meta": {"regularMarketPrice": null}}]}}')
@@ -475,7 +475,7 @@ class FailureTests(Base):
         env = Env()
         Mock.overrides["yahoo/chart_AAPL"] = (200, b'{"something": "else"}')
         it = env.items("AAPL")
-        self.assertEqual(it[0]["title"], "Yahoo Finance: unexpected quote response")
+        self.assertEqual(it[0]["title"], "Couldn’t get data from Yahoo Finance: unexpected quote response")
 
     def test_null_fields(self):
         Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps({"chart": {"result": [{"meta": {
@@ -488,14 +488,23 @@ class FailureTests(Base):
         self.assertNotIn("undefined", json.dumps(it))
 
     def test_network_down_and_timeout(self):
-        self.check(None, "Yahoo Finance: can’t connect", STOCKS_YAHOO_URL="http://127.0.0.1:9")
-        self.check("slow", "Yahoo Finance: timed out", STOCKS_TIMEOUT=1)
+        e = self.check(None, "Can’t reach Yahoo Finance", STOCKS_YAHOO_URL="http://127.0.0.1:9")
+        self.assertEqual((e["subtitle"], e["icon"]["path"]), ("Check your internet connection", "icons/offline.png"))
+        self.check("slow", "Can’t reach Yahoo Finance", STOCKS_TIMEOUT=1)
+
+    def test_offline_row_over_cached_quotes(self):
+        self.env.items()
+        it = self.env.items(STOCKS_TEST_NOW=NOW + 3600, STOCKS_YAHOO_URL="http://127.0.0.1:9")
+        self.assertEqual(it[0]["title"], "Offline: showing results from 1 h ago")
+        self.assertEqual(it[0]["subtitle"], "Check your internet connection")
+        self.assertEqual(it[0]["icon"]["path"], "icons/offline.png")
+        self.assertTrue(it[1]["title"].startswith("^GSPC   7,743.41"))
 
     def test_watchlist_keeps_stale_quotes_and_shows_error(self):
         self.env.items()
         Mock.fault = (429, b"Too Many Requests")
         it = self.env.items(STOCKS_TEST_NOW=NOW + 3600)
-        self.assertEqual(it[0]["title"], "Yahoo Finance: rate limited (HTTP 429)")
+        self.assertEqual(it[0]["title"], "Yahoo Finance is limiting requests")
         self.assertTrue(it[1]["title"].startswith("^GSPC   7,743.41"))
         self.assertIn("as of", it[1]["subtitle"])
         Mock.fault = None
@@ -609,7 +618,7 @@ class KeyedProviderTests(Base):
         Mock.fault = fixture("finnhub/ratelimit")
         env = Env()
         env.set_key("finnhub")
-        self.assertEqual(env.items("AAPL", provider="finnhub")[0]["title"], "Finnhub: rate limited (HTTP 429)")
+        self.assertEqual(env.items("AAPL", provider="finnhub")[0]["title"], "Finnhub is limiting requests")
 
     def test_twelvedata(self):
         self.env.set_key("twelvedata")
@@ -622,7 +631,8 @@ class KeyedProviderTests(Base):
         env = Env()
         env.set_key("twelvedata")
         it = env.items("AAPL", provider="twelvedata")
-        self.assertEqual(it[0]["title"], "Twelve Data: rate limit reached (8 requests a minute on the free plan)")
+        self.assertEqual(it[0]["title"], "Twelve Data is limiting requests")
+        self.assertIn("Rate limit reached (8 requests a minute on the free plan)", it[0]["subtitle"])
 
     def test_alphavantage(self):
         self.env.set_key("alphavantage")
@@ -633,12 +643,13 @@ class KeyedProviderTests(Base):
         self.assertEqual(len([p for p, _ in Mock.requests if "GLOBAL_QUOTE" in p]), 2)  # 1 quote per search (25/day)
         Mock.overrides["alphavantage/quote_MSFT"] = fixture("alphavantage/ratelimit_information")
         it = self.env.items("MSFT", provider="alphavantage")
-        self.assertEqual(it[0]["title"], "Alpha Vantage: daily limit reached (25 requests a day on the free plan)")
+        self.assertEqual(it[0]["title"], "Alpha Vantage is limiting requests")
+        self.assertIn("Daily limit reached (25 requests a day on the free plan)", it[0]["subtitle"])
         self.assertNotIn(KEY, json.dumps(it))
         # the daily limit holds until 00:00 UTC: no more requests until then
         n = len(Mock.requests)
-        self.assertTrue(self.env.items("NOPE", provider="alphavantage")[0]["title"].startswith("Alpha Vantage: daily limit"))
-        self.assertTrue(self.env.items("", provider="alphavantage", STOCKS_TEST_NOW=NOW + 3600)[0]["title"].startswith("Alpha Vantage: daily limit"))
+        self.assertTrue(self.env.items("NOPE", provider="alphavantage")[0]["title"].startswith("Alpha Vantage is limiting requests"))
+        self.assertTrue(self.env.items("", provider="alphavantage", STOCKS_TEST_NOW=NOW + 3600)[0]["title"].startswith("Alpha Vantage is limiting requests"))
         self.assertEqual(len(Mock.requests), n)
         Mock.overrides["alphavantage/quote_NOPE"] = fixture("alphavantage/invalid_call")
         midnight = (NOW // 86400 + 1) * 86400
@@ -740,7 +751,7 @@ class Audit1RegressionTests(Base):
     def test_successful_search_clears_watchlist_error(self):
         self.env.items()
         Mock.fault = (429, b"Too Many Requests")
-        self.assertTrue(self.env.items(STOCKS_TEST_NOW=NOW + 3600)[0]["title"].startswith("Yahoo Finance: rate limited"))
+        self.assertTrue(self.env.items(STOCKS_TEST_NOW=NOW + 3600)[0]["title"].startswith("Yahoo Finance is limiting requests"))
         Mock.fault = None
         for sym in ("^GSPC", "^IXIC", "AAPL"):
             self.env.items(sym, STOCKS_TEST_NOW=NOW + 3700)
@@ -762,7 +773,7 @@ class Audit1RegressionTests(Base):
 
     def test_invalid_utf8_body(self):
         Mock.fault = (200, b"\xff\xfe\x00junk")
-        self.assertEqual(self.env.items("AAPL")[0]["title"], "Yahoo Finance: unexpected response (not JSON) (HTTP 200)")
+        self.assertEqual(self.env.items("AAPL")[0]["title"], "Couldn’t get data from Yahoo Finance: unexpected response (not JSON) (HTTP 200)")
 
     def test_empty_search_results_expire_sooner(self):
         self.env.items("zzzzqqqxx")
@@ -795,11 +806,11 @@ class Audit2RegressionTests(Base):
     def test_failed_refresh_backs_off(self):
         Mock.fault = (429, b"Too Many Requests")
         it = self.env.items()
-        self.assertTrue(it[0]["title"].startswith("Yahoo Finance: rate limited"))
+        self.assertTrue(it[0]["title"].startswith("Yahoo Finance is limiting requests"))
         n = len(Mock.requests)
         it = self.env.items(STOCKS_TEST_NOW=NOW + 30)
         self.assertEqual(len(Mock.requests), n)  # no new attempt (and no rerun loop) for a minute
-        self.assertTrue(it[0]["title"].startswith("Yahoo Finance: rate limited"))
+        self.assertTrue(it[0]["title"].startswith("Yahoo Finance is limiting requests"))
         self.assertEqual(it[1]["subtitle"], "No quote yet")
         self.env.items(STOCKS_TEST_NOW=NOW + 61)
         self.assertGreater(len(Mock.requests), n)
@@ -816,7 +827,7 @@ class Audit2RegressionTests(Base):
         data = self.env.sf(STOCKS_SYNC="0")
         self.assertNotIn("rerun", data)
         self.assertEqual(len(Mock.requests), n)
-        self.assertEqual(data["items"][0]["title"], "Yahoo Finance: server error (HTTP 500)")
+        self.assertEqual(data["items"][0]["title"], "Couldn’t get data from Yahoo Finance: server error (HTTP 500)")
 
     def test_leftover_temp_dirs_are_removed(self):
         old = os.path.join(self.env.cache, "tmp-dead")
@@ -850,8 +861,8 @@ class Audit2RegressionTests(Base):
         self.env.watchlist('{"symbols":["AAPL"]}')
         os.chmod(self.env.data, 0o500)
         try:
-            self.assertEqual(self.env.act("toggle", "TSLA"), "Could not save the watchlist")
-            self.assertEqual(self.env.act("reset", "reset"), "Could not save the watchlist")
+            self.assertEqual(self.env.act("toggle", "TSLA"), "Couldn’t save the watchlist")
+            self.assertEqual(self.env.act("reset", "reset"), "Couldn’t save the watchlist")
         finally:
             os.chmod(self.env.data, 0o700)
         self.assertEqual(self.env.watchlist(), ["AAPL"])
@@ -982,12 +993,12 @@ class Audit4RegressionTests(Base):
         n = len(Mock.requests)
         it = self.env.items("tesco", provider="alphavantage", STOCKS_TEST_NOW=NOW + 60)
         self.assertEqual(len(Mock.requests), n)
-        self.assertTrue(it[0]["title"].startswith("Alpha Vantage: daily limit"))
+        self.assertTrue(it[0]["title"].startswith("Alpha Vantage is limiting requests"))
 
     def test_search_failure_does_not_poison_the_watchlist(self):
         self.env.items()
         Mock.overrides["yahoo/chart_TSLA"] = (500, b"x")
-        self.assertTrue(self.env.items("TSLA", STOCKS_TEST_NOW=NOW + 10)[0]["title"].startswith("Yahoo Finance: server error"))
+        self.assertTrue(self.env.items("TSLA", STOCKS_TEST_NOW=NOW + 10)[0]["title"].startswith("Couldn’t get data from Yahoo Finance: server error"))
         self.assertTrue(self.env.items(STOCKS_TEST_NOW=NOW + 20)[0]["title"].startswith("^GSPC"))
 
     def test_rate_limited_search_backs_off(self):
@@ -996,14 +1007,14 @@ class Audit4RegressionTests(Base):
         n = len(Mock.requests)
         it = self.env.items("tesla", STOCKS_TEST_NOW=NOW + 20)
         self.assertEqual(len(Mock.requests), n)
-        self.assertTrue(it[0]["title"].startswith("Yahoo Finance: rate limited"))
+        self.assertTrue(it[0]["title"].startswith("Yahoo Finance is limiting requests"))
         self.assertTrue(self.env.items("tesla", STOCKS_TEST_NOW=NOW + 70)[0]["title"].startswith("TSLA"))
 
     def test_typed_ticker_quoted_when_search_fails(self):
         Mock.overrides["yahoo/search_aapl"] = (429, b"Too Many Requests")
         it = self.env.items("AAPL")
         self.assertTrue(it[0]["title"].startswith("AAPL   341.07"))
-        self.assertTrue(it[-1]["title"].startswith("Yahoo Finance: rate limited"))
+        self.assertTrue(it[-1]["title"].startswith("Yahoo Finance is limiting requests"))
 
     # --- symbols, formatting, market state
     def test_us_detection_excludes_exchange_suffixes(self):
@@ -1082,7 +1093,7 @@ class Audit4RegressionTests(Base):
     def test_error_text_is_one_line(self):
         Mock.overrides["yahoo/chart_AAPL"] = (200, json.dumps({"chart": {"result": None, "error": {"code": "Internal", "description": "line one\nline two " + "x" * 300}}}).encode())
         title = self.env.items("AAPL")[0]["title"]
-        self.assertTrue(title.startswith("Yahoo Finance: line one line two"), title)
+        self.assertTrue(title.startswith("Couldn’t get data from Yahoo Finance: line one line two"), title)
         self.assertLessEqual(len(title), 130)
 
     def test_lone_surrogates_are_replaced(self):
@@ -1139,7 +1150,8 @@ class FinalReviewRegressionTests(Base):
         n = len(Mock.requests)
         it = self.env.items("MSFT", provider="twelvedata", STOCKS_TEST_NOW=NOW + 20)
         self.assertEqual(len(Mock.requests), n)  # nothing sent: the provider would answer 429
-        self.assertEqual(it[0]["title"], "Twelve Data: request limit reached (8 a minute on the free plan)")
+        self.assertEqual(it[0]["title"], "Twelve Data is limiting requests")
+        self.assertTrue(it[0]["subtitle"].startswith("Try again in a minute · Request limit reached (8 a minute on the free plan)"), it[0]["subtitle"])
         Mock.overrides["twelvedata/quote_MSFT"] = fixture("twelvedata/quote_AAPL")
         it = self.env.items("MSFT", provider="twelvedata", STOCKS_TEST_NOW=NOW + 61)  # the minute is over
         self.assertTrue(it[0]["title"].startswith("MSFT"), it[0]["title"])
