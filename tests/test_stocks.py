@@ -508,26 +508,82 @@ class KeyedProviderTests(Base):
         for p, name in (("finnhub", "Finnhub"), ("twelvedata", "Twelve Data"), ("alphavantage", "Alpha Vantage")):
             it = self.env.items("", provider=p)
             self.assertEqual(it[0]["title"], f"Set your {name} API key")
-            self.assertEqual(it[0]["autocomplete"], ":key ")
+            self.assertTrue(it[0]["subtitle"].startswith("Save it via “stock apikey”"))
+            self.assertEqual(it[0]["autocomplete"], "apikey ")
+            self.assertEqual(it[1]["title"], "Get an API key…")
             self.assertTrue(it[1]["arg"].startswith("https://"))
+        it = self.env.items("", provider="finnhub", STOCKS_TEST_CLIPBOARD=KEY)
+        self.assertEqual([i["title"] for i in it], ["Set your Finnhub API key", "Save API key from clipboard", "Get an API key…"])
+        self.assertEqual(self.env.items("", provider="finnhub", keyword_stock="st")[0]["subtitle"].split(" · ")[0], "Save it via “st apikey”")
         self.assertEqual(Mock.requests, [])
 
     def test_set_and_remove_key(self):
-        it = self.env.items(":key short", provider="finnhub")
-        self.assertEqual(it[0]["title"], "That doesn’t look like an API key")
-        it = self.env.items(f":key {KEY}", provider="finnhub")
-        self.assertEqual(it[0]["title"], "Save Finnhub API key …7890")
+        it = self.env.items("apikey short", provider="finnhub")
+        self.assertEqual(it[0]["title"], "That doesn’t look like a Finnhub API key")
+        it = self.env.items(f"apikey {KEY}", provider="finnhub")
+        self.assertEqual(it[0]["title"], "Save typed API key")
+        self.assertEqual(it[0]["subtitle"], "••••7890 · Typed keys are briefly visible to other processes: the clipboard is safer")
         self.assertEqual(it[0]["variables"]["stocks_action"], "savekey")
         self.assertNotIn(KEY, it[0]["arg"])  # the argument ends up on the action's command line
-        self.assertEqual(self.env.act("savekey", it[0]["arg"], provider="finnhub", stocks_key=it[0]["variables"]["stocks_key"]), "Saved the Finnhub API key")
+        self.assertEqual(self.env.act("savekey", it[0]["arg"], provider="finnhub", stocks_key=it[0]["variables"]["stocks_key"]), "API key saved")
         self.assertEqual(read(os.path.join(self.env.keychain, "io.github.x-o-r-r-o.stocks.finnhub")), KEY)
-        self.assertEqual(self.env.act("savekey", "savekey", provider="finnhub", stocks_key="bad key"), "Not saved: invalid API key")
-        self.assertEqual(self.env.act("savekey", KEY, provider="finnhub"), "Not saved: invalid API key")  # never from argv
+        self.assertEqual(self.env.act("savekey", "savekey", provider="finnhub", stocks_key="bad key"), "Couldn’t save the API key: it doesn’t look like a Finnhub API key")
+        self.assertEqual(self.env.act("savekey", KEY, provider="finnhub"), "Couldn’t save the API key: it doesn’t look like a Finnhub API key")  # never from argv
+        self.assertEqual(self.env.act("savekey", "savekey", stocks_key=KEY), "Couldn’t save the API key: Yahoo Finance doesn’t use one")
         self.assertTrue(self.env.items("AAPL", provider="finnhub")[0]["title"].startswith("AAPL   341.07 USD"))
-        it = self.env.items(":key", provider="finnhub")
-        self.assertEqual(find(it, "Remove")["variables"]["stocks_action"], "delkey")
-        self.assertEqual(self.env.act("delkey", "finnhub", provider="finnhub"), "Removed the Finnhub API key")
+        it = self.env.items("apikey", provider="finnhub")
+        row = find(it, "Remove the saved API key")
+        self.assertEqual(row["subtitle"], "Deletes it from your macOS Keychain")
+        self.assertEqual(row["variables"]["stocks_action"], "delkey")
+        self.assertEqual(self.env.act("delkey", row["arg"], provider="finnhub"), "API key removed")
+        self.assertEqual(self.env.act("delkey", "finnhub", provider="finnhub"), "Couldn’t remove the API key: none is saved")
         self.assertEqual(self.env.items("", provider="finnhub")[0]["title"], "Set your Finnhub API key")
+        self.assertNotIn("Remove the saved API key", [i["title"] for i in self.env.items("apikey", provider="finnhub")])
+
+    def test_key_rows_and_order(self):
+        self.env.set_key("finnhub")
+        it = self.env.items("apikey other-key-99999999", provider="finnhub", STOCKS_TEST_CLIPBOARD=KEY)
+        self.assertEqual([i["title"] for i in it], ["Save API key from clipboard", "Save typed API key", "Remove the saved API key", "Get an API key…"])
+        self.assertEqual([i["icon"]["path"] for i in it], ["icons/key.png", "icons/key.png", "icons/key-remove.png", "icons/key-get.png"])
+        self.assertEqual(it[0]["subtitle"], "••••7890 · Stored in your macOS Keychain")
+        self.assertEqual(it[3]["subtitle"], "Opens Finnhub’s API key page · Copy the key, then type “stock apikey”")
+        # the same key typed and in the clipboard: only the clipboard row (it is cleared afterwards)
+        it = self.env.items(f"apikey {KEY}", provider="finnhub", STOCKS_TEST_CLIPBOARD=KEY)
+        self.assertEqual([i["title"] for i in it][:2], ["Save API key from clipboard", "Remove the saved API key"])
+        self.assertEqual(Mock.requests, [])
+
+    def test_apikey_word_and_aliases(self):
+        self.env.set_key("finnhub")
+        for q in ("apikey", "APIKEY", "ApiKey", ":key", ":KEY"):
+            self.assertEqual(self.env.items(q, provider="finnhub")[-1]["title"], "Get an API key…", q)
+            self.assertEqual(self.env.items(f"{q} other-key-99999999", provider="finnhub")[0]["title"], "Save typed API key", q)
+        self.assertEqual(Mock.requests, [])  # never a ticker search
+        # only the exact first word: “apikeys” and a later “apikey” are ordinary searches
+        self.assertNotEqual(self.env.items("apikeys", provider="finnhub")[-1]["title"], "Get an API key…")
+        self.assertNotEqual(self.env.items("apple apikey", provider="finnhub")[-1]["title"], "Get an API key…")
+        self.assertTrue(Mock.requests)
+        # Yahoo Finance needs no key: say so instead of searching for “APIKEY”
+        Mock.requests.clear()
+        self.assertEqual(self.env.items("apikey")[0]["title"], "Yahoo Finance doesn’t use an API key")
+        self.assertEqual(Mock.requests, [])
+        # the settings list offers it too, and “:k” still finds it
+        row = self.env.items(":k", provider="finnhub")[0]
+        self.assertEqual((row["title"], row["autocomplete"]), ("apikey  API key", "apikey "))
+        self.assertNotIn("match", row)
+
+    def test_clipboard_is_cleared_after_saving(self):
+        out = os.path.join(self.env.dir, "clipboard-out")
+        it = self.env.items("apikey", provider="finnhub", STOCKS_TEST_CLIPBOARD=KEY)[0]
+        v = it["variables"]
+        self.assertEqual(v["stocks_key_source"], "clipboard")
+        self.assertEqual(self.env.act("savekey", it["arg"], provider="finnhub", stocks_key=v["stocks_key"], stocks_key_source="clipboard",
+                                      STOCKS_TEST_CLIPBOARD=KEY, STOCKS_TEST_CLIPBOARD_OUT=out), "API key saved")
+        self.assertEqual(read(out), "cleared")
+        os.remove(out)
+        # the clipboard changed in the meantime, or the key was typed: left alone
+        self.env.act("savekey", "savekey", provider="finnhub", stocks_key=KEY, stocks_key_source="clipboard", STOCKS_TEST_CLIPBOARD="something else", STOCKS_TEST_CLIPBOARD_OUT=out)
+        self.env.act("savekey", "savekey", provider="finnhub", stocks_key=KEY, stocks_key_source="typed", STOCKS_TEST_CLIPBOARD=KEY, STOCKS_TEST_CLIPBOARD_OUT=out)
+        self.assertFalse(os.path.exists(out))
 
     def test_finnhub(self):
         self.env.set_key("finnhub")
@@ -546,8 +602,9 @@ class KeyedProviderTests(Base):
     def test_finnhub_bad_key_and_rate_limit(self):
         self.env.set_key("finnhub", "wrong-key-123456")
         it = self.env.items("AAPL", provider="finnhub")
-        self.assertEqual(it[0]["title"], "Finnhub: API key rejected (HTTP 401)")
-        self.assertEqual(it[0]["autocomplete"], ":key ")
+        self.assertEqual(it[0]["title"], "Finnhub rejected your API key")
+        self.assertEqual(it[0]["subtitle"], "Save a new one via “stock apikey”")
+        self.assertEqual(it[0]["autocomplete"], "apikey ")
         self.env.set_key("finnhub")
         Mock.fault = fixture("finnhub/ratelimit")
         env = Env()
@@ -634,7 +691,7 @@ class ActionTests(Base):
         it = self.env.items(":")
         self.assertEqual([i["title"].split()[0] for i in it], [":reset", ":cache", ":config"])
         self.assertEqual([i["title"].split()[0] for i in self.env.items(":ca")], [":cache"])
-        self.assertIn(":key", [i["title"].split()[0] for i in self.env.items(":", provider="twelvedata")])
+        self.assertIn("apikey", [i["title"].split()[0] for i in self.env.items(":", provider="twelvedata")])
         self.env.items("AAPL")
         self.assertEqual(self.env.act("clearcache", "clearcache"), "Cleared cached quotes")
         self.assertFalse(os.path.exists(os.path.join(self.env.cache, "quotes.json")))
@@ -827,19 +884,29 @@ class Audit4RegressionTests(Base):
     def test_api_key_stays_off_command_lines(self):
         js = read(os.path.join(SRC, "stocks.js"))
         self.assertNotIn("/usr/bin/security", js)  # `security … -w KEY` showed the key in `ps`
-        it = self.env.items(f":key {KEY}", provider="finnhub")[0]
+        it = self.env.items(f"apikey {KEY}", provider="finnhub")[0]
         self.assertNotIn(KEY, it["arg"])
         self.assertNotIn(KEY, json.dumps(it["text"]))
         self.assertNotIn(KEY, it["title"])
         self.assertEqual(it["variables"]["stocks_key"], KEY)
-        self.assertEqual(self.env.act("savekey", it["arg"], provider="finnhub", stocks_key=KEY), "Saved the Finnhub API key")
+        out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "act", it["arg"]], cwd=SRC, capture_output=True, text=True,
+                             env=self.env.vars(provider="finnhub", **it["variables"])).stdout
+        self.assertEqual(out.strip(), "API key saved")
+        self.assertNotIn(KEY, out)
+        raw = self.raw("apikey", provider="finnhub", STOCKS_TEST_CLIPBOARD=KEY).decode()
+        self.assertEqual(raw.count(KEY), 1)  # only in the item's variables
+        for i in json.loads(raw)["items"]:
+            for m in i.get("mods", {}).values():
+                self.assertNotIn(KEY, m["arg"])
 
     def test_key_from_the_clipboard(self):
-        it = self.env.items(":key", provider="twelvedata", STOCKS_TEST_CLIPBOARD=KEY)
-        self.assertEqual(it[0]["title"], "Save the Twelve Data API key from the clipboard …7890")
-        self.assertEqual(it[0]["variables"], {"stocks_action": "savekey", "stocks_key": KEY})
-        it = self.env.items(":key", provider="twelvedata", STOCKS_TEST_CLIPBOARD="not a key at all")
+        it = self.env.items("apikey", provider="twelvedata", STOCKS_TEST_CLIPBOARD=KEY)
+        self.assertEqual(it[0]["title"], "Save API key from clipboard")
+        self.assertEqual(it[0]["variables"], {"stocks_action": "savekey", "stocks_key": KEY, "stocks_key_source": "clipboard"})
+        it = self.env.items("apikey", provider="twelvedata", STOCKS_TEST_CLIPBOARD="not a key at all")
         self.assertFalse(it[0]["title"].startswith("Save"))
+        for word in ("watchlist", "password", "12345678901234567"):  # plain words aren't offered as keys
+            self.assertFalse(self.env.items("apikey", provider="twelvedata", STOCKS_TEST_CLIPBOARD=word)[0]["title"].startswith("Save"), word)
 
     # --- refresh lock
     def lock(self, **fields):
@@ -1294,12 +1361,12 @@ class KeychainTests(unittest.TestCase):
         act = lambda action, key="": subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "act", action], cwd=SRC,
                                                    env=dict(v, stocks_action=action, stocks_key=key), capture_output=True, text=True).stdout.strip()
         try:
-            self.assertEqual(act("savekey", "throwaway-key-111111"), "Saved the Finnhub API key")
-            self.assertEqual(act("savekey", "throwaway-key-222222"), "Saved the Finnhub API key")  # update in place
-            out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "filter", ":key"], cwd=SRC, env=v, capture_output=True, text=True).stdout
-            self.assertIn("Remove the saved Finnhub API key", out)
-            self.assertEqual(act("delkey"), "Removed the Finnhub API key")
-            self.assertEqual(act("delkey"), "No API key to remove")
+            self.assertEqual(act("savekey", "throwaway-key-111111"), "API key saved")
+            self.assertEqual(act("savekey", "throwaway-key-222222"), "API key saved")  # update in place
+            out = subprocess.run(["osascript", "-l", "JavaScript", "./stocks.js", "filter", "apikey"], cwd=SRC, env=v, capture_output=True, text=True).stdout
+            self.assertIn("Remove the saved API key", out)
+            self.assertEqual(act("delkey"), "API key removed")
+            self.assertEqual(act("delkey"), "Couldn’t remove the API key: none is saved")
         finally:
             subprocess.run(["security", "delete-generic-password", "-s", svc, "-a", "finnhub"], capture_output=True)
             shutil.rmtree(env.dir, ignore_errors=True)

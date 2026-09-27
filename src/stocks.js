@@ -571,8 +571,23 @@ function clipboardText() {
   const s = $.NSPasteboard.generalPasteboard.stringForType($.NSPasteboardTypeString);
   return s.isNil() ? "" : s.js.trim();
 }
+// After a key is saved from the clipboard, clear the clipboard if it still holds that key.
+// The test suite stands in with STOCKS_TEST_CLIPBOARD, and STOCKS_TEST_CLIPBOARD_OUT records the clearing.
+function clearClipboardIf(text) {
+  const t = env("STOCKS_TEST_CLIPBOARD", null);
+  if (t !== null) {
+    const out = env("STOCKS_TEST_CLIPBOARD_OUT", "");
+    if (out && t.trim() === text) writeFile(out, "cleared");
+    return;
+  }
+  if (clipboardText() === text) $.NSPasteboard.generalPasteboard.clearContents;
+}
 function validKey(k) {
   return /^[A-Za-z0-9._\-]{8,128}$/.test(k);
+}
+// A clipboard worth offering as a key: a valid key with letters and digits, 16+ characters
+function plausibleKey(k) {
+  return validKey(k) && k.length >= 16 && /\d/.test(k) && /[A-Za-z]/.test(k);
 }
 
 // ---------- formatting ----------
@@ -1089,17 +1104,17 @@ function actionItem(title, subtitle, action, arg, iconName, extra = {}) {
 }
 
 function errorItem(err, p) {
+  // a missing or rejected key points to `stock apikey`, with the same wording as the other workflows
+  if (err.kind === "nokey") return info(`Set your ${p.name} API key`, `Save it via “${keyCommand()}”`, "key", { autocomplete: "apikey " });
+  if (err.kind === "auth" && p.needsKey) return info(`${p.name} rejected your API key`, `Save a new one via “${keyCommand()}”`, "error", { autocomplete: "apikey " });
   const hints = {
-    auth: p.needsKey ? "↩ Set a new API key" : "The provider blocked the request. ↩ Pick another provider in the Workflow’s Configuration",
+    auth: "The provider blocked the request. ↩ Pick another provider in the Workflow’s Configuration",
     rate: "Wait a little, or ↩ pick another provider in the Workflow’s Configuration",
     network: "Check your internet connection",
-    nokey: "↩ Set your API key",
   };
   const sub = hints[err.kind] || "The service may have changed or be down. ↩ Pick another provider in the Workflow’s Configuration";
   const msg = oneLine(redact(err.message), 100); // provider text: may hold newlines or be long
   const title = `${p.name}: ${msg}${err.status && !/\d{3}/.test(msg) ? ` (HTTP ${err.status})` : ""}`;
-  if ((err.kind === "auth" && p.needsKey) || err.kind === "nokey")
-    return info(title, sub, "error", { valid: false, autocomplete: ":key " });
   if (err.kind === "network") return info(title, sub, "error");
   return actionItem(title, sub, "config", "config", "error");
 }
@@ -1323,52 +1338,77 @@ function searchItems(query) {
   return { items };
 }
 
+// ---------- API key rows ----------
+// The same rows, wording and icons as the other x-o-r-r-o workflows: `stock apikey` offers
+// "Save API key from clipboard", "Save typed API key", "Remove the saved API key" and
+// "Get an API key…". The key travels to the action in a variable (the environment), never as the
+// argument, which the action script would receive on its command line (visible in `ps`).
+
+function kwStock() {
+  return env("keyword_stock", "").trim() || "stock"; // a required field can still arrive empty
+}
+function keyCommand() {
+  return `${kwStock()} apikey`;
+}
+function maskKey(k) {
+  return `••••${k.slice(-4)}`;
+}
+function saveKeyItem(source, key) {
+  const masked = maskKey(key);
+  const typed = source === "typed";
+  const sub = typed ? `${masked} · Typed keys are briefly visible to other processes: the clipboard is safer` : `${masked} · Stored in your macOS Keychain`;
+  return actionItem(typed ? "Save typed API key" : "Save API key from clipboard", sub, "savekey", "savekey", "key", {
+    variables: { stocks_action: "savekey", stocks_key: key, stocks_key_source: source },
+    text: { copy: masked, largetype: masked },
+  });
+}
+function getKeyItem(p) {
+  return actionItem("Get an API key…", `Opens ${p.name}’s API key page · Copy the key, then type “${keyCommand()}”`, "open", p.keyURL, "key-get");
+}
+function keyItems(p, typed) {
+  if (!p.needsKey)
+    return [actionItem(`${p.name} doesn’t use an API key`, "↩ Pick Finnhub, Twelve Data or Alpha Vantage in the Workflow’s Configuration", "config", "config", "settings")];
+  const items = [];
+  const clip = clipboardText();
+  if (plausibleKey(clip)) items.push(saveKeyItem("clipboard", clip));
+  if (typed && typed !== clip) {
+    if (validKey(typed)) items.push(saveKeyItem("typed", typed));
+    else items.push(info(`That doesn’t look like a ${p.name} API key`, "Paste the key exactly as shown on the provider’s site", "error"));
+  }
+  if (getKey(p)) items.push(actionItem("Remove the saved API key", "Deletes it from your macOS Keychain", "delkey", p.id, "key-remove"));
+  items.push(getKeyItem(p));
+  return items;
+}
+
 function settingsItems(query) {
   const p = provider();
   const [cmd, ...rest] = query.slice(1).split(/\s+/);
   const argText = rest.join(" ").trim();
-  if (cmd === "key" && p.needsKey) {
-    // The key travels to the action in a variable (the environment), never as the argument,
-    // which the action script would receive on its command line (visible in `ps`)
-    const saveItem = (key, title) => {
-      const t = `${title} …${key.slice(-4)}`;
-      return actionItem(t, "↩ Store it in your macOS Keychain", "savekey", "savekey", "key", { variables: { stocks_action: "savekey", stocks_key: key }, text: { copy: t, largetype: t } });
-    };
-    if (argText) {
-      if (!validKey(argText)) return { items: [info("That doesn’t look like an API key", "Paste the key exactly as shown on the provider’s site", "error")] };
-      return { items: [saveItem(argText, `Save ${p.name} API key`)] };
-    }
-    const items = [];
-    const clip = clipboardText();
-    if (validKey(clip)) items.push(saveItem(clip, `Save the ${p.name} API key from the clipboard`));
-    items.push(
-      info(`Paste your ${p.name} API key after “:key ”`, "It is stored in your macOS Keychain, never in the workflow’s files", "key"),
-      actionItem(`Get a free ${p.name} API key`, p.keyURL, "open", p.keyURL, "search"),
-    );
-    if (getKey(p)) items.push(actionItem(`Remove the saved ${p.name} API key`, "↩ Delete it from the Keychain", "delkey", p.id, "error"));
-    return { items };
-  }
+  if (cmd.toLowerCase() === "key") return { items: keyItems(p, argText) }; // “:key” is an alias of “apikey”
   const all = [
-    p.needsKey ? info(":key  Set API key", `Save your ${p.name} API key in the Keychain`, "key", { autocomplete: ":key " }) : null,
+    p.needsKey ? info("apikey  API key", `Save or remove your ${p.name} API key`, "key", { autocomplete: "apikey ", match: "key" }) : null,
     actionItem(":reset  Reset the watchlist", `↩ Replace it with ${defaultWatchlist().join(", ")} (a backup is kept)`, "reset", "reset", "watch", { autocomplete: ":reset" }),
     actionItem(":cache  Clear cached quotes", "↩ Fetch everything again", "clearcache", "clearcache", "refresh", { autocomplete: ":cache" }),
     actionItem(":config  Open the Workflow’s Configuration", `Provider: ${p.name}${p.id === "yahoo" ? " (unofficial API, no key)" : ""} · Opens in ${siteName()}`, "config", "config", "settings", { autocomplete: ":config" }),
   ].filter(Boolean);
-  const matches = all.filter((i) => i.title.slice(1).startsWith(cmd || ""));
+  const matches = all.filter((i) => (i.match || i.title.slice(1)).startsWith(cmd || ""));
+  for (const i of all) delete i.match; // “:k” still finds the API key row
   return { items: matches.length ? matches : all };
 }
 
 function filter(query) {
   const p = provider();
   const q = query.replace(/[\r\n\t]+/g, " ").trim();
+  // “apikey” as the exact first word (any case) opens the API key rows; it is never a ticker search
+  const ak = /^apikey(?:\s+([\s\S]*))?$/i.exec(q);
+  if (ak) return { items: keyItems(p, (ak[1] || "").trim()) };
   if (q.startsWith(":")) return settingsItems(q);
   if (p.needsKey && !(KEY = getKey(p))) {
-    return {
-      items: [
-        info(`Set your ${p.name} API key`, "⇥ then paste the key · or pick Yahoo Finance (no key) in the Workflow’s Configuration", "key", { autocomplete: ":key " }),
-        actionItem(`Get a free ${p.name} API key`, p.keyURL, "open", p.keyURL, "search"),
-      ],
-    };
+    const items = [info(`Set your ${p.name} API key`, `Save it via “${keyCommand()}” · or pick Yahoo Finance (no key) in the Workflow’s Configuration`, "key", { autocomplete: "apikey " })];
+    const clip = clipboardText();
+    if (plausibleKey(clip)) items.push(saveKeyItem("clipboard", clip));
+    items.push(getKeyItem(p));
+    return { items };
   }
   return q === "" ? watchlistItems() : searchItems(q);
 }
@@ -1389,7 +1429,7 @@ function refresh(symbols) {
 // ---------- actions ----------
 
 function reopen() {
-  const kw = env("keyword_stock", "").trim() || "stock"; // a required field can still arrive empty
+  const kw = kwStock();
   exec("/usr/bin/osascript", ["-e", "on run argv", "-e", 'tell application id "com.runningwithcrayons.Alfred" to search (item 1 of argv)', "-e", "end run", `${kw} `]);
 }
 
@@ -1442,13 +1482,18 @@ function act(arg) {
       return "Cleared cached quotes";
     case "savekey": {
       const key = env("stocks_key", "").trim(); // from the Script Filter's variables, never argv
-      if (!p.needsKey || !validKey(key)) return "Not saved: invalid API key";
-      if (!setKey(p, key)) return "Could not save the key to the Keychain";
+      if (!p.needsKey) return `Couldn’t save the API key: ${p.name} doesn’t use one`;
+      if (!validKey(key)) return `Couldn’t save the API key: it doesn’t look like a ${p.name} API key`;
+      if (!setKey(p, key)) return "Couldn’t save the API key: the Keychain refused it";
+      if (env("stocks_key_source", "") === "clipboard") clearClipboardIf(key);
       removeFile(statusPath());
-      return `Saved the ${p.name} API key`;
+      return "API key saved";
     }
     case "delkey":
-      return deleteKey(p) ? `Removed the ${p.name} API key` : "No API key to remove";
+      if (!getKey(p)) return "Couldn’t remove the API key: none is saved";
+      if (!deleteKey(p)) return "Couldn’t remove the API key: the Keychain refused it";
+      removeFile(statusPath());
+      return "API key removed";
     case "config":
       if (!test) exec("/usr/bin/osascript", ["-e", "on run argv", "-e", 'tell application id "com.runningwithcrayons.Alfred" to reveal workflow (item 1 of argv)', "-e", "end run", BUNDLE]);
       return report ? "config" : "";

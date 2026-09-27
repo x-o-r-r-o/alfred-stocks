@@ -20,7 +20,7 @@ Raycast demand this workflow replaces (downloads, 2026-09-26):
 - [x] Company/ticker search (Yahoo search endpoint or the keyed provider's search), crypto (`BTC-USD`) and FX (`EURUSD=X`)
 - [x] Market state (pre / open / after hours / closed), currency, exchange; ▲▼ with green/red icons
 - [x] ↩ open in Yahoo Finance / Google Finance / TradingView / Stocks.app, ⌘↩ copy price, ⌥↩ add/remove, ⌃↩ move to (or add at) the top
-- [x] Providers: Yahoo Finance (no key, unofficial) by default; Finnhub, Twelve Data, Alpha Vantage with the key in the Keychain (`:key`)
+- [x] Providers: Yahoo Finance (no key, unofficial) by default; Finnhub, Twelve Data, Alpha Vantage with the key in the Keychain (`stock apikey`, or `stock :key`)
 - [x] Cache: quotes 60 s while a session is open, 15 min when closed; background refresh with `rerun`; searches 24 h
 - [x] Clear provider errors (401/403/429/5xx/malformed/empty/timeout/offline) pointing to the Workflow’s Configuration
 - [x] Damaged watchlist file detected, symbols salvaged, backup kept
@@ -32,7 +32,7 @@ Raycast demand this workflow replaces (downloads, 2026-09-26):
 - Keyed free plans mostly cover US markets; other symbols show "Not available on your plan".
 - Alpha Vantage's 25 requests a day go quickly: every new search costs a search and a quote.
 - The request log counts only this workflow's requests; a key also used elsewhere can still hit the provider's limit (then the 429 back-off applies).
-- Alfred passes the typed query to the Script Filter's bash as an argument, so a key typed after `:key` is visible in `ps` for a few milliseconds (bash then `exec`s osascript with the query in the environment). Saving the key from the clipboard avoids it.
+- Alfred passes the typed query to the Script Filter's bash as an argument, so a key typed after `apikey` is visible in `ps` for a few milliseconds (bash then `exec`s osascript with the query in the environment). Saving the key from the clipboard avoids it, and the “Save typed API key” row says so.
 - NYSE holidays are listed for 2026–2027 (only used by Finnhub and Alpha Vantage quotes; later years fall back to weekdays).
 
 ## Round 4 audit (post-release, 2026-09-27)
@@ -42,6 +42,7 @@ Raycast demand this workflow replaces (downloads, 2026-09-26):
 - [x] Script Filter `queuemode` 2 (terminate the previous run, as Alfred's own network workflows do) instead of 1 (wait, so a slow request held up the next keystroke). Every write is atomic; the `mkdir` locks and the refresh lock carry the owner's pid, so a killed run's lock is taken over at once (was: up to 3 s wait, or 30 s of "Loading…")
 - [x] Actions print nothing on success (JXA `return ""` printed a newline: a possible empty notification after ↩)
 - [x] v1.1: after-hours / pre-market price (Yahoo Finance, `includePrePost`), ⇧↩ copies a summary line, ★ marks search results already in the watchlist
+- [x] v1.1.0: one API-key flow shared with Linear, Local AI and Focus Timer: `stock apikey` (`stock :key` still works) offers “Save API key from clipboard” (the clipboard is now cleared after saving), “Save typed API key”, “Remove the saved API key” and “Get an API key…”; missing and rejected keys point to `stock apikey`
 
 ## Ideas for v1.1
 Ranked by value for effort (sources: raycast/extensions issues and changelogs for Stock Tracker and Stock Lookup, 2023–2026):

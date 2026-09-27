@@ -6,6 +6,8 @@
   "error": ["exclamationmark.triangle.fill", "#DC2626"],
   "info": ["info.circle.fill", "#64748B"],
   "key": ["key.horizontal.fill", "#D97706"],
+  "key-remove": ["trash.fill", "#DC2626"],
+  "key-get": ["arrow.up.forward.square.fill", "#2563EB"],
   "search": ["magnifyingglass", "#2563EB"],
   "watch": ["star.fill", "#CA8A04"],
   "refresh": ["arrow.clockwise", "#0891B2"],

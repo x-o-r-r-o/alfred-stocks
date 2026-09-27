@@ -24,7 +24,7 @@
       "type": "popupbutton",
       "variable": "provider",
       "label": "Data provider",
-      "description": "Yahoo Finance needs no key but is unofficial and may break or rate-limit. The others need a free API key: set it with “:key” after the keyword.",
+      "description": "Yahoo Finance needs no key but is unofficial and may break or rate-limit. The others need a free API key: set it with “apikey” after the keyword.",
       "config": {
         "default": "yahoo",
         "pairs": [

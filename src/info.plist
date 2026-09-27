@@ -255,7 +255,9 @@ Reset the watchlist (`:reset`), clear cached quotes (`:cache`) or open the Workf
 
 ### Data providers
 
-Yahoo Finance is used by default and needs no account. Its API is unofficial and can change or block requests without notice (that is how the older Alfred stock workflows broke), so the workflow tells you when a provider fails. Pick Finnhub, Twelve Data or Alpha Vantage in the Workflow’s Configuration instead, then save a free API key with `:key` followed by the key, or copy the key and type `:key`, via the `stock` keyword. Keys are stored in the macOS Keychain.
+Yahoo Finance is used by default and needs no account. Its API is unofficial and can change or block requests without notice (that is how the older Alfred stock workflows broke), so the workflow tells you when a provider fails. Pick Finnhub, Twelve Data or Alpha Vantage in the Workflow’s Configuration instead.
+
+Then save your provider’s free API key via `stock apikey`: copy the key and press &lt;kbd&gt;↩&lt;/kbd&gt; on “Save API key from clipboard”, or type it after `apikey`. The key is stored in your macOS Keychain, and the clipboard is cleared once it’s saved. “Get an API key…” opens the page where you create one, and “Remove the saved API key” deletes it.
 
 Symbols follow each provider’s conventions: Yahoo Finance uses `^GSPC`, `BTC-USD`, `EURUSD=X` and exchange suffixes like `7203.T`; Finnhub uses `BINANCE:BTCUSDT`; Twelve Data uses `BTC/USD` and `EUR/USD`. Sparklines are drawn for Yahoo Finance quotes only. The free plans of the keyed providers mostly cover US markets (other symbols show as not available on your plan) and have tight limits. The workflow keeps within them, so their quotes refresh less often (every 5 minutes with Twelve Data, every 3 hours with Alpha Vantage, which allows 25 requests a day) and it tells you when the limit is reached.
 
@@ -354,7 +356,7 @@ Every keyword can be changed in the Workflow’s Configuration.
 				</array>
 			</dict>
 			<key>description</key>
-			<string>Yahoo Finance needs no key but is unofficial and may break or rate-limit. The others need a free API key: set it with “:key” after the keyword.</string>
+			<string>Yahoo Finance needs no key but is unofficial and may break or rate-limit. The others need a free API key: set it with “apikey” after the keyword.</string>
 			<key>label</key>
 			<string>Data provider</string>
 			<key>type</key>
