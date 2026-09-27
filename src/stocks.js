@@ -1423,6 +1423,17 @@ function settingsItems(query) {
   return { items: matches.length ? matches : all };
 }
 
+// Rows need a uid for Alfred to keep the selected row while the Script Filter reruns (rerun):
+// without one the selection jumps back to the first row on every rerun (found in real Alfred).
+// The uid is the position plus the title with its numbers masked, so countdowns, prices and clocks
+// keep it, while typing something new changes it and the selection resets to the top as usual.
+function stableUids(items) {
+  items.forEach((it, i) => {
+    if (it && !it.uid) it.uid = `${i}|${String(it.title || "").replace(/[0-9]+/g, "#")}`;
+  });
+  return items;
+}
+
 function filter(query) {
   const p = provider();
   const q = query.replace(/[\r\n\t]+/g, " ").trim();
@@ -1543,8 +1554,12 @@ function run(argv) {
   const [cmd, ...rest] = argv;
   try {
     switch (cmd) {
-      case "filter": // the query comes in stocks_query (see workflow.json) or, for tests, as arguments
-        return JSON.stringify(Object.assign({ skipknowledge: true }, filter(rest.length ? rest.join(" ") : env("stocks_query", ""))), wellFormed);
+      case "filter": {
+        // the query comes in stocks_query (see workflow.json) or, for tests, as arguments
+        const res = filter(rest.length ? rest.join(" ") : env("stocks_query", ""));
+        stableUids(res.items || []);
+        return JSON.stringify(Object.assign({ skipknowledge: true }, res), wellFormed);
+      }
       case "refresh":
         refresh(rest);
         return undefined;
